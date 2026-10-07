@@ -476,6 +476,7 @@ local task4_registry_path = root .. '/task4-data/agent-board/repos.json'
 storage.registry_path = function() return task4_registry_path end
 local task4_repo_a = git_init(root .. '/task4-repo-a')
 local task4_repo_b = git_init(root .. '/task4-repo-b')
+local task4_lane = assert(api.add_lane(task4_repo_a, 'Review'))
 local function make_task(repo, title)
   return assert(tasks.create_task({ repo = repo, title = title }))
 end
@@ -489,6 +490,9 @@ local rename_task = make_task(task4_repo_a, 'Rename target')
 local delete_task = make_task(task4_repo_a, 'Delete target')
 local concurrent_a = make_task(task4_repo_a, 'Concurrent A')
 local concurrent_b = make_task(task4_repo_a, 'Concurrent B')
+for _, item in ipairs({ failed_start_task, started_task, save_failed_task }) do
+  assert(api.move_task({ repo = task4_repo_a, id = item.id }, task4_lane.id))
+end
 
 vim.env.HERDR_SOCKET_PATH = root .. '/task4.sock'
 local task4_server = 'socket:' .. root .. '/task4.sock'
@@ -563,7 +567,7 @@ local failed_start, failed_start_error = await(function(callback)
   api.start_agent({ repo = task4_repo_a, id = failed_start_task.id }, { provider = 'codex' }, callback)
 end)
 assert(failed_start == nil and failed_start_error, 'failed Herdr start reports an error')
-eq(tasks.get_task({ repo = task4_repo_a, id = failed_start_task.id }).status, 'todo', 'failed start leaves status unchanged')
+eq(tasks.get_task({ repo = task4_repo_a, id = failed_start_task.id }).status, task4_lane.id, 'failed start leaves the custom lane unchanged')
 eq(tasks.get_task({ repo = task4_repo_a, id = failed_start_task.id }).agent, vim.NIL, 'failed start leaves link empty')
 
 start_failure = nil
@@ -572,7 +576,7 @@ local started_task_value, started_error = await(function(callback)
   api.start_agent({ repo = task4_repo_a, id = started_task.id }, { provider = 'codex' }, callback)
 end)
 assert(started_task_value and not started_error)
-eq(started_task_value.status, 'doing', 'successful start and Doing status are saved together')
+eq(started_task_value.status, task4_lane.id, 'successful start preserves the selected custom lane')
 assert(started_task_value.agent.terminal_id and starts == start_count_before + 1, 'successful start persists returned terminal identity')
 
 local opened_existing = 0
@@ -605,7 +609,7 @@ end)
 storage.write_locked = saved_write_locked
 assert(save_failed == nil and save_error and save_error.agent and save_error.agent.terminal_id, 'save failure returns the started agent identity')
 eq(stops, stops_before_save_failure, 'save failure never stops a started agent')
-eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).status, 'todo', 'save failure does not claim Doing was persisted')
+eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).status, task4_lane.id, 'save failure preserves the selected custom lane')
 
 local stop_identity = identity_for('term-stop', 'task4:stop', 'stop-agent', 'session-stop')
 live_agents[stop_identity.pane_id] = live_for(stop_identity)

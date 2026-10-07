@@ -184,7 +184,7 @@ vim.cmd('qa!')
  assert(vim.wait(10000,function()return duplicate_done end) and duplicate_error.code=='locked','real double start blocked')
  assert(vim.wait(45000,function()return started_done end) and started_value,vim.inspect(started_error))
  local fresh_uuid=started_value.conversation.session_id
- assert(fresh_uuid~=uuid and started_value.status=='doing','native new conversation persisted')
+ assert(fresh_uuid~=uuid and started_value.status=='todo','native new conversation stays in its current lane')
  await(function(cb)api.open_agent(fresh_ref,cb,{tabpage=board_tab,label=fresh.title})end)
  local fresh_buf=vim.api.nvim_get_current_buf()
  assert(vim.wait(10000,function()

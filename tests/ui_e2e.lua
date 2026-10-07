@@ -160,7 +160,7 @@ local agent_task_id = repo_rows[#repo_rows].task.id
 select_responses[#select_responses + 1] = choose('codex')
 press('a')
 local started_task = task_from(repo_a, agent_task_id)
-eq(started_task.status, 'doing')
+eq(started_task.status, 'todo', 'starting an agent keeps the task in its current lane')
 assert(started_task.agent ~= vim.NIL and starts == 1)
 
 press('<CR>')

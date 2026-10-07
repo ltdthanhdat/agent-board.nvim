@@ -706,7 +706,6 @@ function M.start_agent(ref, opts, callback)
         return done(nil, unique_error)
       end
       tx.task.agent = identity
-      tx.task.status = 'doing'
       local saved, save_error = tx.commit()
       tx.release()
       if not saved then
@@ -941,7 +940,6 @@ local function launch_conversation(tx, conversation, mode, done, terminal_opts, 
     tx.task.conversation = vim.deepcopy(conversation)
     tx.task.pending_start = nil
     tx.task.agent = stored_identity(started.identity)
-    if mode == '--session-id' then tx.task.status = 'doing' end
     local saved, save_error = tx.commit()
     tx.release()
     if not saved then uncertain[key]={conversation=conversation,host=started.host};return done(nil, runtime_failure('save_failed', tostring(save_error), {agent=started.identity,host=started.host})) end

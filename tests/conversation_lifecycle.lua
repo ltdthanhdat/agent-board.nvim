@@ -100,12 +100,15 @@ assert(not prompt and prompt_error.code=='offline','offline prompt requires open
 local fresh=assert(api.create_task({repo=repo,title='New'}))
 local fresh_ref={repo=repo,id=fresh.id}
 local fresh_started=assert(await(function(cb)api.start_agent(fresh_ref,{provider='claude'},cb)end))
-assert(fresh_started.conversation.session_id~=id and fresh_started.status=='doing','new explicit UUID')
+assert(fresh_started.conversation.session_id~=id and fresh_started.status=='todo','new explicit UUID keeps its lane')
 local fresh_id=fresh_started.conversation.session_id
 history(fresh_id)
 assert(await(function(cb)api.stop_agent(fresh_ref,cb)end))
 assert(await(function(cb)api.open_agent(fresh_ref,cb)end))
 assert(api.get_task(fresh_ref).conversation.session_id==fresh_id,'new_exit_resume')
+assert(api.get_task(fresh_ref).status=='todo','offline resume keeps the task lane')
+local reopened_new=assert(await(function(cb)api.start_agent(fresh_ref,{provider='claude'},cb)end))
+assert(reopened_new and api.get_task(fresh_ref).status=='todo','starting a linked Claude task keeps its lane')
 assert(api.delete_task(fresh_ref));assert(vim.uv.fs_stat(config..'/projects/repo/'..fresh_id..'.jsonl'),'delete preserves history')
 agents={}
 local legacy=assert(api.create_task({repo=repo,title='Legacy'}))
@@ -124,6 +127,7 @@ doc.version=1
 local f=assert(io.open(board_file,'w'));f:write(vim.json.encode(doc));f:close()
 assert(await(function(cb)api.open_agent(legacy_ref,cb)end))
 assert(api.get_task(legacy_ref).conversation~=vim.NIL,'v1_native_promotion_on_open')
+
 agents={}
 local empty=assert(api.create_task({repo=repo,title='No transcript'}))
 local empty_ref={repo=repo,id=empty.id}
@@ -241,15 +245,28 @@ local unknown_bound=assert(await(function(cb)api.bind_conversation({repo=repo,id
 assert(unknown_bound.conversation.session_id==bind_while_unknown_id,'metadata can be bound while runtime state is unknown')
 list_error=nil
 -- Herdr failure before it returns a host is a definitive pre-launch failure and clears reservation.
+local custom_lane=assert(api.add_lane(repo,'Review'))
+local custom_task=assert(api.create_task({repo=repo,title='Custom lane Claude'}))
+local custom_ref={repo=repo,id=custom_task.id}
+assert(api.move_task(custom_ref,custom_lane.id))
+local custom_started=assert(await(function(cb)api.start_agent(custom_ref,{provider='claude'},cb)end))
+assert(custom_started.status==custom_lane.id,'new Claude start keeps a custom lane')
+local custom_id=custom_started.conversation.session_id
+history(custom_id)
+assert(await(function(cb)api.stop_agent(custom_ref,cb)end))
+assert(await(function(cb)api.open_agent(custom_ref,cb)end))
+assert(api.get_task(custom_ref).status==custom_lane.id,'Claude resume keeps a custom lane')
 local retry_task=assert(api.create_task({repo=repo,title='Prelaunch failure'}))
 local retry_ref={repo=repo,id=retry_task.id}
+assert(api.move_task(retry_ref,custom_lane.id))
 start_error={code='runtime_unavailable',message='workspace list failed'}
 local failed_prelaunch,prelaunch_error=await(function(cb)api.start_agent(retry_ref,{provider='claude'},cb)end)
 assert(not failed_prelaunch and prelaunch_error.code=='runtime_unavailable','prelaunch failure returned')
 assert(api.get_task(retry_ref).pending_start==nil and api.get_task(retry_ref).conversation==vim.NIL,'prelaunch failure releases reservation')
+assert(api.get_task(retry_ref).status==custom_lane.id,'failed start keeps the custom lane')
 start_error=nil
 local retried=assert(await(function(cb)api.start_agent(retry_ref,{provider='claude'},cb)end))
-assert(retried.status=='doing','retry after confirmed prelaunch failure succeeds')
+assert(retried.status==custom_lane.id,'retry after confirmed prelaunch failure keeps the custom lane')
 await(function(cb)api.stop_agent(retry_ref,cb)end)
 vim.fn.delete(tmp,'rf')
 print('conversation lifecycle checks passed')
