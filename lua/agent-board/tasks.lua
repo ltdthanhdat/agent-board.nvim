@@ -617,17 +617,21 @@ function M.start_agent(ref, opts, callback)
   end
 end
 
-local function get_linked_identity(ref)
+local function get_linked_identity(ref, expected_agent)
   local task, task_error = M.get_task(ref)
   if not task then return nil, runtime_failure('task_not_found', task_error) end
   if not linked(task.agent) then return nil, runtime_failure('no_agent', 'task has no linked agent') end
+  if expected_agent and not vim.deep_equal(task.agent, expected_agent) then
+    return nil, runtime_failure('conflict', 'task agent link changed; reload before acting')
+  end
   return task, runtime_identity(task.agent)
 end
 
-function M.open_agent(ref, callback)
+function M.open_agent(ref, expected_agent, callback)
+  if type(expected_agent) == 'function' then callback, expected_agent = expected_agent, nil end
   if type(callback) ~= 'function' then return nil, 'a callback is required' end
   local done = callback_once(callback)
-  local task, identity_or_error = get_linked_identity(ref)
+  local task, identity_or_error = get_linked_identity(ref, expected_agent)
   if not task then return done(nil, identity_or_error) end
   local herdr = require('agent-board.herdr')
   herdr.resolve(identity_or_error, function(live, resolve_error)
@@ -651,10 +655,11 @@ function M.hide_agent(ref)
   return true
 end
 
-function M.send(ref, message, callback)
+function M.send(ref, message, expected_agent, callback)
+  if type(expected_agent) == 'function' then callback, expected_agent = expected_agent, nil end
   if type(callback) ~= 'function' then return nil, 'a callback is required' end
   local done = callback_once(callback)
-  local task, identity_or_error = get_linked_identity(ref)
+  local task, identity_or_error = get_linked_identity(ref, expected_agent)
   if not task then return done(nil, identity_or_error) end
   local herdr = require('agent-board.herdr')
   herdr.send(identity_or_error, message, function(value, err)
@@ -662,10 +667,11 @@ function M.send(ref, message, callback)
   end)
 end
 
-function M.stop_agent(ref, callback)
+function M.stop_agent(ref, expected_agent, callback)
+  if type(expected_agent) == 'function' then callback, expected_agent = expected_agent, nil end
   if type(callback) ~= 'function' then return nil, 'a callback is required' end
   local done = callback_once(callback)
-  local task, identity_or_error = get_linked_identity(ref)
+  local task, identity_or_error = get_linked_identity(ref, expected_agent)
   if not task then return done(nil, identity_or_error) end
   local herdr = require('agent-board.herdr')
   herdr.stop(identity_or_error, function(value, err)

@@ -186,8 +186,15 @@ eq(spawn_count, 1, 'reopen reuses the attach client')
 press('<Esc>')
 press('q')
 
+local regular_send, selected_send_identity = api.send, nil
+api.send = function(ref, message, expected_agent, callback)
+  selected_send_identity = expected_agent
+  return regular_send(ref, message, expected_agent, callback)
+end
 input_responses[#input_responses + 1] = 'Reply with only OK'
 press('p')
+api.send = regular_send
+eq(selected_send_identity, started_task.agent, 'send is bound to the agent shown when its prompt opened')
 eq(prompts[#prompts], { pane_id = started_task.agent.pane_id, message = 'Reply with only OK' }, 'p sends the entered prompt')
 
 select_responses[#select_responses + 1] = function() return nil end
@@ -245,7 +252,14 @@ board.refresh()
 vim.wait(20)
 
 select_responses[#select_responses + 1] = choose('Stop')
+local regular_stop_agent, selected_stop_identity = api.stop_agent, nil
+api.stop_agent = function(ref, expected_agent, callback)
+  selected_stop_identity = expected_agent
+  return regular_stop_agent(ref, expected_agent, callback)
+end
 press('s')
+api.stop_agent = regular_stop_agent
+eq(selected_stop_identity, bound_task.agent, 'stop is bound to the agent shown when its confirmation opened')
 eq(task_from(repo_a, bind_task_id).status, 'todo', 'confirmed stop does not change task status')
 eq(task_from(repo_a, bind_task_id).agent.terminal_id, existing_identity.terminal_id, 'stop keeps the persisted link')
 local saved_ids = row_ids(repo_a)

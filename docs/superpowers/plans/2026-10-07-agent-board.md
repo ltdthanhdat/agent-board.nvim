@@ -31,7 +31,7 @@
 3. Agent chạy được nhưng save thất bại: trả identity để phục hồi, không stop agent hay báo đã lưu (Task 4).
 4. Pane bị thay agent hoặc server restart: không attach/send/stop nhầm occupant (Task 3/4).
 5. Window đóng trong lúc query đang chạy: callback không ghi vào buffer chết, poller được dừng (Task 5).
-6. Prompt/picker còn mở qua một lần poll: callback giữ snapshot lúc thao tác bắt đầu để không ghi đè writer mới (Task 5/6).
+6. Prompt/confirmation còn mở qua một lần poll hoặc rebind: callback giữ snapshot và agent identity đang hiển thị để không ghi đè writer hay tác động nhầm phiên mới (Task 5/6).
 
 ## Trạng thái đầu vào và các quyết định triển khai
 

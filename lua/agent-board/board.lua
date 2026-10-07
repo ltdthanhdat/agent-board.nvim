@@ -371,7 +371,7 @@ end
 local function action_open(state)
   local ref, item = selected_ref(state)
   if not item or not has_agent(item.task.agent) then return end
-  api.open_agent(ref, function(_, err)
+  api.open_agent(ref, item.task.agent, function(_, err)
     if err then
       notify(err.code == 'offline' and 'agent is offline; press a to start a new session' or show_error(err))
     end
@@ -383,7 +383,7 @@ local function action_send(state)
   if not item or not has_agent(item.task.agent) then return end
   vim.ui.input({ prompt = 'Prompt: ' }, function(message)
     if not message or message == '' then return end
-    api.send(ref, message, function(_, err)
+    api.send(ref, message, item.task.agent, function(_, err)
       if err then notify(show_error(err)) end
     end)
   end)
@@ -411,7 +411,7 @@ local function action_stop(state)
   local ref, item = selected_ref(state)
   if not item or not has_agent(item.task.agent) then return end
   confirm(state, 'Stop this agent and close its Herdr pane?', 'Stop', function()
-    api.stop_agent(ref, function(_, err)
+    api.stop_agent(ref, item.task.agent, function(_, err)
       if err then return notify(show_error(err)) end
       M.refresh()
     end)

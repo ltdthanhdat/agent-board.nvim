@@ -404,7 +404,7 @@ local previous_runtime = {
   send = herdr.send,
   stop = herdr.stop,
 }
-local live_agents, starts, stops, start_failure = {}, 0, 0, nil
+local live_agents, starts, sends, stops, start_failure = {}, 0, 0, 0, nil
 local hold_pane, held_resolve
 
 local function identity_for(terminal_id, pane_id, name, session_id)
@@ -444,6 +444,7 @@ herdr.start = function(repo, provider, name, callback)
 end
 
 herdr.send = function(_, _, callback)
+  sends = sends + 1
   callback(true)
 end
 
@@ -458,6 +459,15 @@ local bound, bind_error = await(function(callback) api.bind_agent({ repo = task4
 assert(bound and not bind_error, 'binding a live agent should succeed')
 eq(bound.status, 'todo', 'binding does not move the task')
 eq(bound.agent.terminal_id, bind_identity.terminal_id, 'binding persists verified identity')
+
+local stale_identity = vim.deepcopy(bind_identity)
+stale_identity.session_id = 'replaced-session'
+local sends_before_stale_identity = sends
+local stale_send, stale_send_error = await(function(callback)
+  api.send({ repo = task4_repo_a, id = bind_task.id }, 'must not be sent', stale_identity, callback)
+end)
+assert(stale_send == nil and stale_send_error.code == 'conflict', 'send refuses a task whose current link differs from the selected identity')
+eq(sends, sends_before_stale_identity, 'stale send does not reach Herdr')
 
 local live_replacement_identity = identity_for('term-live-replacement', 'task4:live-replacement', 'replacement-agent', 'session-replacement')
 live_agents[live_replacement_identity.pane_id] = live_for(live_replacement_identity)
@@ -540,6 +550,14 @@ local stop_target = await(function(callback)
   api.bind_agent({ repo = task4_repo_a, id = stop_task.id }, stop_identity, callback)
 end)
 assert(stop_target)
+local stale_stop_identity = vim.deepcopy(stop_identity)
+stale_stop_identity.session_id = 'replaced-session'
+local stops_before_stale_identity = stops
+local stale_stop, stale_stop_error = await(function(callback)
+  api.stop_agent({ repo = task4_repo_a, id = stop_task.id }, stale_stop_identity, callback)
+end)
+assert(stale_stop == nil and stale_stop_error.code == 'conflict', 'stop refuses a task whose current link differs from the confirmed identity')
+eq(stops, stops_before_stale_identity, 'stale stop does not reach Herdr')
 local stopped, stop_error = await(function(callback) api.stop_agent({ repo = task4_repo_a, id = stop_task.id }, callback) end)
 assert(stopped and not stop_error)
 eq(stops, stops_before_save_failure + 1, 'stop calls Herdr once')

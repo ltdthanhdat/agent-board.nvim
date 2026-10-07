@@ -16,11 +16,11 @@
 3. Xác nhận offline, timeout và server error được phân biệt; runtime error không được diễn giải là agent offline.
 4. Xác nhận agent đã link ở repo khác hoặc đã được bind đồng thời không thể link lần hai.
 5. Xác nhận board đăng ký hỏng/mất ngăn bind fail-open và attempted bind giữ nguyên bytes JSON lỗi trong headless checks. Chạy runner hai process: cả hai đọc cùng revision, writer B cập nhật trước, writer A nhận yêu cầu reload; JSON cuối vẫn giữ title mới và Todo.
-6. Xác nhận rename, Done và delete không stop linked agent; stop qua fake Herdr chỉ gọi một lần và giữ task status/link.
+6. Xác nhận rename, Done và delete không stop linked agent; stale expected identity từ send/stop bị từ chối trước Herdr; stop qua fake Herdr chỉ gọi một lần và giữ task status/link.
 
 ## Actual
 
-Hai commands exit 0. Headless output `agent-board checks passed`; assertions gồm failed start, identity sessionless fail closed, save failure recovery identity và bind, không thay link đang live, corrupt board bytes giữ nguyên, stale snapshot, duplicate/concurrent link và lifecycle không stop agent khi rename/Done/delete. Runner hai process ghi `Neovim A rejected stale snapshot with reload-required error`, `Neovim B saved a newer task revision`, và xác nhận JSON cuối giữ title `Fresh update from Neovim B` cùng status `todo`.
+Hai commands exit 0. Headless output `agent-board checks passed`; assertions gồm failed start, identity sessionless fail closed, save failure recovery identity và bind, không thay link đang live, stale expected identity không gửi/dừng nhầm agent, corrupt board bytes giữ nguyên, stale snapshot, duplicate/concurrent link và lifecycle không stop agent khi rename/Done/delete. Runner hai process ghi `Neovim A rejected stale snapshot with reload-required error`, `Neovim B saved a newer task revision`, và xác nhận JSON cuối giữ title `Fresh update from Neovim B` cùng status `todo`.
 
 ## Evidence
 
