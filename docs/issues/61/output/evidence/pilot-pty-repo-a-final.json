@@ -1,1 +1,0 @@
-{"revision":8,"version":1,"tasks":[{"agent":{"name":"codex-pty","session_id":"session-pty","terminal_id":"term-pty","runtime":"herdr","pane_id":"w1:p1","provider":"codex","server":"socket:/tmp/agent-board-pty.jFr98G/herdr.sock"},"status":"done","title":"PTY rename check 🔐","id":"pty-task"}]}
