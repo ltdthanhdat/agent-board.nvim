@@ -162,6 +162,145 @@ local function stale(expected, actual)
   return expected ~= nil and (type(expected) ~= 'table' or expected.data ~= actual.data)
 end
 
+local function callback_once(callback)
+  local called = false
+  return function(...)
+    if called then return end
+    called = true
+    local args = { ... }
+    vim.schedule(function() callback(unpack(args)) end)
+  end
+end
+
+local function runtime_failure(code, message, extra)
+  local err = { code = code, message = message }
+  for key, value in pairs(extra or {}) do err[key] = value end
+  return err
+end
+
+local function guarded(tx, done, callback)
+  return function(...)
+    local args = { ... }
+    local ok, callback_error = pcall(callback, unpack(args))
+    if not ok then
+      tx.release()
+      done(nil, runtime_failure('runtime_error', tostring(callback_error)))
+    end
+  end
+end
+
+local function linked(agent)
+  return type(agent) == 'table' and agent ~= vim.NIL
+end
+
+local function runtime_identity(agent)
+  local identity = vim.deepcopy(agent)
+  if identity.name == vim.NIL then identity.name = nil end
+  if identity.session_id == vim.NIL then identity.session_id = nil end
+  return identity
+end
+
+local function stored_identity(identity)
+  return {
+    provider = identity.provider,
+    runtime = identity.runtime,
+    server = identity.server,
+    terminal_id = identity.terminal_id,
+    pane_id = identity.pane_id,
+    name = identity.name or vim.NIL,
+    session_id = identity.session_id or vim.NIL,
+  }
+end
+
+local function same_agent(left, right)
+  return linked(left) and linked(right)
+    and left.runtime == right.runtime
+    and left.server == right.server
+    and left.terminal_id == right.terminal_id
+end
+
+local function begin_transaction(ref, expected_snapshot)
+  local valid_ref, ref_error = task_ref(ref)
+  if not valid_ref then return nil, runtime_failure('invalid_input', ref_error) end
+  local root, root_error = M.resolve_repo(ref.repo)
+  if not root then return nil, runtime_failure('repo_unavailable', root_error) end
+
+  local path = board_path(root)
+  local registry_file = storage.registry_path()
+  local releases, lock_error = acquire({ registry_file, path })
+  if not releases then return nil, runtime_failure('locked', lock_error) end
+  local function release()
+    release_all(releases)
+    releases = {}
+  end
+
+  local registry, registry_snapshot = load_registry()
+  if not registry then
+    release()
+    return nil, runtime_failure('registry_unavailable', registry_snapshot)
+  end
+  local document, snapshot = storage.read(path, 'board')
+  if not document then
+    release()
+    return nil, runtime_failure('board_unavailable', snapshot)
+  end
+  if stale(expected_snapshot, snapshot) then
+    release()
+    return nil, runtime_failure('conflict', 'board changed; reload before saving')
+  end
+  local index, task = find_task(document, ref.id)
+  if not index then
+    release()
+    return nil, runtime_failure('task_not_found', 'task not found: ' .. ref.id)
+  end
+  local registry_changed = register_in_document(registry, root)
+  return {
+    root = root,
+    registry = registry,
+    registry_snapshot = registry_snapshot,
+    registry_changed = registry_changed,
+    document = document,
+    snapshot = snapshot,
+    task = task,
+    release = release,
+    commit = function()
+      return save_changes(root, registry, registry_snapshot, document, snapshot, registry_changed)
+    end,
+  }
+end
+
+local function unique_agent(tx, identity)
+  for _, registered_root in ipairs(tx.registry.repos) do
+    local root, root_error = M.resolve_repo(registered_root)
+    if not root then
+      return nil, runtime_failure('board_unavailable', 'registered repo is unavailable: ' .. tostring(root_error))
+    end
+    if root ~= registered_root then
+      return nil, runtime_failure('board_unavailable', 'registered repo root changed: ' .. registered_root)
+    end
+    local document
+    if root == tx.root then
+      document = tx.document
+    else
+      local read_error
+      document, read_error = storage.read(board_path(root), 'board')
+      if not document then
+        return nil, runtime_failure('board_unavailable', tostring(read_error))
+      end
+    end
+    for _, other in ipairs(document.tasks) do
+      if (root ~= tx.root or other.id ~= tx.task.id) and same_agent(other.agent, identity) then
+        return nil, runtime_failure('already_bound', 'this Herdr session is already linked to a task')
+      end
+    end
+  end
+  return true
+end
+
+local function terminal_key(repo, id)
+  return table.concat({ repo, id, 'herdr' }, '\0')
+end
+
 function M.register_repo(path)
   local root, root_error = M.resolve_repo(path)
   if not root then
@@ -353,6 +492,167 @@ function M.delete_task(ref, expected_snapshot)
       return error_result(save_error)
     end
     return true
+  end)
+end
+
+function M.bind_agent(ref, identity, expected_snapshot, callback)
+  if type(expected_snapshot) == 'function' then
+    callback, expected_snapshot = expected_snapshot, nil
+  end
+  if type(callback) ~= 'function' then return nil, 'a callback is required' end
+  local done = callback_once(callback)
+  local tx, tx_error = begin_transaction(ref, expected_snapshot)
+  if not tx then return done(nil, tx_error) end
+  if linked(tx.task.agent) then
+    tx.release()
+    return done(nil, runtime_failure('already_linked', 'task already has a linked agent'))
+  end
+
+  local herdr = require('agent-board.herdr')
+  local on_resolved = guarded(tx, done, function(live, resolve_error)
+    if not live then
+      tx.release()
+      return done(nil, resolve_error or runtime_failure('runtime_unavailable', 'could not verify Herdr agent'))
+    end
+    local unique, unique_error = unique_agent(tx, live.identity)
+    if not unique then
+      tx.release()
+      return done(nil, unique_error)
+    end
+    tx.task.agent = stored_identity(live.identity)
+    local saved, save_error = tx.commit()
+    tx.release()
+    if not saved then
+      return done(nil, runtime_failure('save_failed', tostring(save_error)))
+    end
+    done(vim.deepcopy(tx.task))
+  end)
+  local ok, resolve_call_error = pcall(herdr.resolve, identity, on_resolved)
+  if not ok then
+    tx.release()
+    done(nil, runtime_failure('runtime_error', tostring(resolve_call_error)))
+  end
+end
+
+function M.start_agent(ref, opts, callback)
+  if type(callback) ~= 'function' then return nil, 'a callback is required' end
+  if type(opts) ~= 'table' or (opts.provider ~= 'claude' and opts.provider ~= 'codex' and opts.provider ~= 'pi') then
+    return callback_once(callback)(nil, runtime_failure('invalid_input', 'a supported provider is required'))
+  end
+  local done = callback_once(callback)
+  local tx, tx_error = begin_transaction(ref, opts.expected_snapshot)
+  if not tx then return done(nil, tx_error) end
+  local herdr = require('agent-board.herdr')
+
+  local function start_new()
+    local name = 'ab-' .. vim.fn.sha256(tx.root .. '\0' .. tx.task.id):sub(1, 16)
+    local on_started = guarded(tx, done, function(started, start_error)
+      if not started then
+        tx.release()
+        return done(nil, start_error or runtime_failure('runtime_unavailable', 'Herdr could not start the agent'))
+      end
+      if type(started.identity) ~= 'table' then
+        tx.release()
+        return done(nil, runtime_failure('runtime_unavailable', 'Herdr start returned no agent identity', { host = started.host }))
+      end
+      local identity = stored_identity(started.identity)
+      local unique, unique_error = unique_agent(tx, identity)
+      if not unique then
+        tx.release()
+        unique_error.agent = identity
+        unique_error.host = started.host
+        return done(nil, unique_error)
+      end
+      tx.task.agent = identity
+      tx.task.status = 'doing'
+      local saved, save_error = tx.commit()
+      tx.release()
+      if not saved then
+        return done(nil, runtime_failure('save_failed', tostring(save_error), { agent = identity, host = started.host }))
+      end
+      done(vim.deepcopy(tx.task))
+    end)
+    local ok, start_call_error = pcall(herdr.start, tx.root, opts.provider, name, on_started)
+    if not ok then
+      tx.release()
+      done(nil, runtime_failure('runtime_error', tostring(start_call_error)))
+    end
+  end
+
+  if not linked(tx.task.agent) then return start_new() end
+  local on_resolved = guarded(tx, done, function(live, resolve_error)
+    if live then
+      tx.release()
+      local existing = vim.deepcopy(tx.task)
+      existing.existing = true
+      return done(existing)
+    end
+    if resolve_error and resolve_error.code == 'offline' then
+      return start_new()
+    end
+    tx.release()
+    done(nil, resolve_error or runtime_failure('runtime_unavailable', 'could not verify linked Herdr agent'))
+  end)
+  local ok, resolve_call_error = pcall(herdr.resolve, runtime_identity(tx.task.agent), on_resolved)
+  if not ok then
+    tx.release()
+    done(nil, runtime_failure('runtime_error', tostring(resolve_call_error)))
+  end
+end
+
+local function get_linked_identity(ref)
+  local task, task_error = M.get_task(ref)
+  if not task then return nil, runtime_failure('task_not_found', task_error) end
+  if not linked(task.agent) then return nil, runtime_failure('no_agent', 'task has no linked agent') end
+  return task, runtime_identity(task.agent)
+end
+
+function M.open_agent(ref, callback)
+  if type(callback) ~= 'function' then return nil, 'a callback is required' end
+  local done = callback_once(callback)
+  local task, identity_or_error = get_linked_identity(ref)
+  if not task then return done(nil, identity_or_error) end
+  local herdr = require('agent-board.herdr')
+  herdr.resolve(identity_or_error, function(live, resolve_error)
+    if not live then return done(nil, resolve_error) end
+    local root, root_error = M.resolve_repo(ref.repo)
+    if not root then return done(nil, runtime_failure('repo_unavailable', root_error)) end
+    local terminal = require('agent-board.terminal')
+    local opened, open_error = terminal.open(terminal_key(root, task.id), live.identity)
+    if not opened then return done(nil, open_error) end
+    done(live)
+  end)
+end
+
+function M.hide_agent(ref)
+  local valid_ref, ref_error = task_ref(ref)
+  if not valid_ref then return error_result(ref_error) end
+  local root, root_error = M.resolve_repo(ref.repo)
+  if not root then return error_result(root_error) end
+  local terminal = require('agent-board.terminal')
+  terminal.hide(terminal_key(root, ref.id))
+  return true
+end
+
+function M.send(ref, message, callback)
+  if type(callback) ~= 'function' then return nil, 'a callback is required' end
+  local done = callback_once(callback)
+  local task, identity_or_error = get_linked_identity(ref)
+  if not task then return done(nil, identity_or_error) end
+  local herdr = require('agent-board.herdr')
+  herdr.send(identity_or_error, message, function(value, err)
+    done(value, err)
+  end)
+end
+
+function M.stop_agent(ref, callback)
+  if type(callback) ~= 'function' then return nil, 'a callback is required' end
+  local done = callback_once(callback)
+  local task, identity_or_error = get_linked_identity(ref)
+  if not task then return done(nil, identity_or_error) end
+  local herdr = require('agent-board.herdr')
+  herdr.stop(identity_or_error, function(value, err)
+    done(value, err)
   end)
 end
 

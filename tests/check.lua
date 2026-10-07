@@ -342,5 +342,276 @@ release_invalid()
 local release_after_error = assert(storage.lock(board_path))
 release_after_error()
 
+local api = require('agent-board')
+for _, name in ipairs({ 'start_agent', 'bind_agent', 'open_agent', 'hide_agent', 'send', 'stop_agent' }) do
+  assert(type(api[name]) == 'function', 'public lifecycle API is missing: ' .. name)
+end
+
+local terminal = require('agent-board.terminal')
+assert(type(terminal.open) == 'function' and type(terminal.hide) == 'function' and type(terminal.is_open) == 'function', 'terminal API is missing')
+
+local task4_registry_path = root .. '/task4-data/agent-board/repos.json'
+storage.registry_path = function() return task4_registry_path end
+local task4_repo_a = git_init(root .. '/task4-repo-a')
+local task4_repo_b = git_init(root .. '/task4-repo-b')
+local function make_task(repo, title)
+  return assert(tasks.create_task({ repo = repo, title = title }))
+end
+local bind_task = make_task(task4_repo_a, 'Bind target')
+local duplicate_task = make_task(task4_repo_b, 'Duplicate target')
+local failed_start_task = make_task(task4_repo_a, 'Failed start')
+local started_task = make_task(task4_repo_a, 'Started task')
+local save_failed_task = make_task(task4_repo_a, 'Save failure')
+local stop_task = make_task(task4_repo_a, 'Stop target')
+local rename_task = make_task(task4_repo_a, 'Rename target')
+local delete_task = make_task(task4_repo_a, 'Delete target')
+local concurrent_a = make_task(task4_repo_a, 'Concurrent A')
+local concurrent_b = make_task(task4_repo_a, 'Concurrent B')
+
+vim.env.HERDR_SOCKET_PATH = root .. '/task4.sock'
+local task4_server = 'socket:' .. root .. '/task4.sock'
+local previous_runtime = {
+  resolve = herdr.resolve,
+  start = herdr.start,
+  send = herdr.send,
+  stop = herdr.stop,
+}
+local live_agents, starts, stops, start_failure = {}, 0, 0, nil
+local hold_pane, held_resolve
+
+local function identity_for(terminal_id, pane_id, name, session_id)
+  return {
+    provider = 'codex', runtime = 'herdr', server = task4_server,
+    terminal_id = terminal_id, pane_id = pane_id, name = name,
+    session_id = session_id or vim.NIL,
+  }
+end
+
+local function live_for(identity)
+  return { identity = vim.deepcopy(identity), cwd = task4_repo_a, state = 'working' }
+end
+
+herdr.resolve = function(identity, callback)
+  if identity.pane_id == hold_pane then
+    held_resolve = callback
+    return
+  end
+  local live = live_agents[identity.pane_id]
+  if not live then
+    return callback(nil, { code = 'offline', message = 'offline' })
+  end
+  callback(live)
+end
+
+herdr.start = function(repo, provider, name, callback)
+  starts = starts + 1
+  if start_failure then
+    return callback(nil, vim.deepcopy(start_failure))
+  end
+  local identity = identity_for('term-start-' .. starts, 'task4:p' .. starts, name, 'session-start-' .. starts)
+  identity.provider = provider
+  local live = { identity = identity, cwd = repo, state = 'idle' }
+  live_agents[identity.pane_id] = live
+  callback({ identity = vim.deepcopy(identity), host = { workspace_id = 'task4-w', tab_id = 'task4-t', pane_id = identity.pane_id } })
+end
+
+herdr.send = function(_, _, callback)
+  callback(true)
+end
+
+herdr.stop = function(identity, callback)
+  stops = stops + 1
+  callback(true)
+end
+
+local bind_identity = identity_for('term-bound', 'task4:bound', 'existing-agent', 'session-bound')
+live_agents[bind_identity.pane_id] = live_for(bind_identity)
+local bound, bind_error = await(function(callback) api.bind_agent({ repo = task4_repo_a, id = bind_task.id }, bind_identity, callback) end)
+assert(bound and not bind_error, 'binding a live agent should succeed')
+eq(bound.status, 'todo', 'binding does not move the task')
+eq(bound.agent.terminal_id, bind_identity.terminal_id, 'binding persists verified identity')
+
+local duplicate, duplicate_error = await(function(callback)
+  api.bind_agent({ repo = task4_repo_b, id = duplicate_task.id }, bind_identity, callback)
+end)
+assert(duplicate == nil and duplicate_error and duplicate_error.code == 'already_bound', 'agent already linked on another repo is rejected')
+
+start_failure = { code = 'start_failed', message = 'provider is not installed' }
+local failed_start, failed_start_error = await(function(callback)
+  api.start_agent({ repo = task4_repo_a, id = failed_start_task.id }, { provider = 'codex' }, callback)
+end)
+assert(failed_start == nil and failed_start_error, 'failed Herdr start reports an error')
+eq(tasks.get_task({ repo = task4_repo_a, id = failed_start_task.id }).status, 'todo', 'failed start leaves status unchanged')
+eq(tasks.get_task({ repo = task4_repo_a, id = failed_start_task.id }).agent, vim.NIL, 'failed start leaves link empty')
+
+start_failure = nil
+local start_count_before = starts
+local started_task_value, started_error = await(function(callback)
+  api.start_agent({ repo = task4_repo_a, id = started_task.id }, { provider = 'codex' }, callback)
+end)
+assert(started_task_value and not started_error)
+eq(started_task_value.status, 'doing', 'successful start and Doing status are saved together')
+assert(started_task_value.agent.terminal_id and starts == start_count_before + 1, 'successful start persists returned terminal identity')
+
+local opened_existing = 0
+local original_terminal_open = terminal.open
+terminal.open = function(_, identity)
+  opened_existing = opened_existing + 1
+  eq(identity.terminal_id, started_task_value.agent.terminal_id, 'existing start opens the linked agent')
+  return true
+end
+local existing_start_count = starts
+local existing_task, existing_error = await(function(callback)
+  api.start_agent({ repo = task4_repo_a, id = started_task.id }, { provider = 'codex' }, callback)
+end)
+assert(existing_task and not existing_error and existing_task.existing, 'starting an already-live task reuses its agent')
+eq(starts, existing_start_count, 'an already-live link does not spawn another agent')
+eq(opened_existing, 1, 'an already-live link opens its existing terminal')
+terminal.open = original_terminal_open
+
+local saved_write_locked = storage.write_locked
+storage.write_locked = function(path, document, snapshot)
+  if path == task4_repo_a .. '/.agent-board.json' then
+    return nil, 'simulated disk failure'
+  end
+  return saved_write_locked(path, document, snapshot)
+end
+local stops_before_save_failure = stops
+local save_failed, save_error = await(function(callback)
+  api.start_agent({ repo = task4_repo_a, id = save_failed_task.id }, { provider = 'codex' }, callback)
+end)
+storage.write_locked = saved_write_locked
+assert(save_failed == nil and save_error and save_error.agent and save_error.agent.terminal_id, 'save failure returns the started agent identity')
+eq(stops, stops_before_save_failure, 'save failure never stops a started agent')
+eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).status, 'todo', 'save failure does not claim Doing was persisted')
+
+local stop_identity = identity_for('term-stop', 'task4:stop', 'stop-agent', 'session-stop')
+live_agents[stop_identity.pane_id] = live_for(stop_identity)
+local stop_target = await(function(callback)
+  api.bind_agent({ repo = task4_repo_a, id = stop_task.id }, stop_identity, callback)
+end)
+assert(stop_target)
+local stopped, stop_error = await(function(callback) api.stop_agent({ repo = task4_repo_a, id = stop_task.id }, callback) end)
+assert(stopped and not stop_error)
+eq(stops, stops_before_save_failure + 1, 'stop calls Herdr once')
+local stopped_task = tasks.get_task({ repo = task4_repo_a, id = stop_task.id })
+eq(stopped_task.status, 'todo', 'stopping an agent leaves its task status unchanged')
+eq(stopped_task.agent.terminal_id, stop_identity.terminal_id, 'stop preserves the task link')
+
+local rename_identity = identity_for('term-rename', 'task4:rename', 'rename-agent', 'session-rename')
+local delete_identity = identity_for('term-delete', 'task4:delete', 'delete-agent', 'session-delete')
+live_agents[rename_identity.pane_id] = live_for(rename_identity)
+live_agents[delete_identity.pane_id] = live_for(delete_identity)
+assert(await(function(callback) api.bind_agent({ repo = task4_repo_a, id = rename_task.id }, rename_identity, callback) end))
+assert(await(function(callback) api.bind_agent({ repo = task4_repo_a, id = delete_task.id }, delete_identity, callback) end))
+assert(api.update_task({ repo = task4_repo_a, id = rename_task.id }, { title = 'Renamed task' }))
+assert(api.move_task({ repo = task4_repo_a, id = rename_task.id }, 'done'))
+assert(api.delete_task({ repo = task4_repo_a, id = delete_task.id }))
+eq(stops, stops_before_save_failure + 1, 'rename, Done, and delete do not stop agents')
+
+local concurrent_identity = identity_for('term-concurrent', 'task4:concurrent', 'concurrent-agent', 'session-concurrent')
+local concurrent_live = live_for(concurrent_identity)
+live_agents[concurrent_identity.pane_id] = concurrent_live
+hold_pane = concurrent_identity.pane_id
+local first_bind_calls, first_bind_value, first_bind_error = 0, nil, nil
+api.bind_agent({ repo = task4_repo_a, id = concurrent_a.id }, concurrent_identity, function(value, err)
+  first_bind_calls = first_bind_calls + 1
+  first_bind_value, first_bind_error = value, err
+end)
+assert(held_resolve, 'first bind keeps the coordinator lock while Herdr verifies identity')
+local second_bind, second_bind_error = await(function(callback)
+  api.bind_agent({ repo = task4_repo_a, id = concurrent_b.id }, concurrent_identity, callback)
+end)
+assert(second_bind == nil and second_bind_error, 'concurrent bind cannot pass the held coordinator lock')
+held_resolve(concurrent_live)
+hold_pane = nil
+assert(vim.wait(1000, function() return first_bind_calls > 0 end, 5), 'first bind callback timed out')
+eq(first_bind_calls, 1, 'first concurrent bind callback runs once')
+assert(first_bind_value and not first_bind_error)
+
+local missing_registered = git_init(root .. '/task4-missing-registered')
+assert(tasks.register_repo(missing_registered))
+assert(vim.fn.delete(missing_registered, 'rf') == 0)
+local missing_identity = identity_for('term-missing', 'task4:missing')
+live_agents[missing_identity.pane_id] = live_for(missing_identity)
+local failed_closed, missing_error = await(function(callback)
+  api.bind_agent({ repo = task4_repo_a, id = concurrent_b.id }, missing_identity, callback)
+end)
+assert(failed_closed == nil and missing_error and missing_error.code == 'board_unavailable', 'missing registered repo fails closed during uniqueness scan')
+
+local task4_registry, task4_registry_snapshot = storage.read(task4_registry_path, 'registry')
+local registry_release = assert(storage.lock(task4_registry_path))
+for index, repo in ipairs(task4_registry.repos) do
+  if repo == missing_registered then
+    table.remove(task4_registry.repos, index)
+    break
+  end
+end
+task4_registry.revision = task4_registry.revision + 1
+assert(storage.write_locked(task4_registry_path, task4_registry, task4_registry_snapshot))
+registry_release()
+
+local corrupt_registered = git_init(root .. '/task4-corrupt-registered')
+assert(tasks.register_repo(corrupt_registered))
+write(corrupt_registered .. '/.agent-board.json', '{broken json')
+local corrupt_identity = identity_for('term-corrupt', 'task4:corrupt')
+live_agents[corrupt_identity.pane_id] = live_for(corrupt_identity)
+local failed_closed_corrupt, corrupt_error = await(function(callback)
+  api.bind_agent({ repo = task4_repo_a, id = concurrent_b.id }, corrupt_identity, callback)
+end)
+assert(failed_closed_corrupt == nil and corrupt_error and corrupt_error.code == 'board_unavailable', 'corrupt registered repo fails closed during uniqueness scan')
+
+local fake_jobs, running_jobs, spawn_count, spawn_exits = {}, {}, 0, {}
+terminal.spawn_term = function(argv, on_exit)
+  spawn_count = spawn_count + 1
+  local job = spawn_count
+  fake_jobs[job] = vim.deepcopy(argv)
+  running_jobs[job] = true
+  spawn_exits[job] = on_exit
+  return job
+end
+terminal.job_running = function(job) return running_jobs[job] == true end
+local terminal_key = 'task4-terminal-key'
+local first_terminal_identity = identity_for('term-terminal-1', 'task4:terminal-1', 'terminal-one', 'session-one')
+local first_entry = assert(terminal.open(terminal_key, first_terminal_identity))
+eq(fake_jobs[1], { 'herdr', 'agent', 'attach', first_terminal_identity.pane_id }, 'terminal attaches using argv')
+local normal_maps = vim.api.nvim_buf_get_keymap(first_entry.buf, 'n')
+local has_hide_key = false
+for _, map in ipairs(normal_maps) do
+  if map.lhs == 'q' then has_hide_key = true end
+end
+assert(has_hide_key, 'terminal buffer has a local q hide mapping')
+terminal.hide(terminal_key)
+assert(vim.api.nvim_buf_is_valid(first_entry.buf) and running_jobs[first_entry.job], 'hide keeps the attach buffer and job alive')
+local reopened_entry = assert(terminal.open(terminal_key, first_terminal_identity))
+eq(reopened_entry.buf, first_entry.buf, 'reopen reuses the live attach buffer')
+eq(spawn_count, 1, 'reopening a live attach does not spawn a second client')
+
+running_jobs[first_entry.job] = false
+spawn_exits[first_entry.job](first_entry.job, 0, 'exit')
+assert(vim.wait(1000, function() return not terminal.is_open(terminal_key) end, 5), 'attach exit cleans the terminal registry')
+local after_exit_entry = assert(terminal.open(terminal_key, first_terminal_identity))
+eq(spawn_count, 2, 'reopen after attach exit starts a new client')
+
+local replacement_identity = identity_for('term-terminal-2', 'task4:terminal-2', 'terminal-two', 'session-two')
+local stopped_before_replace = stops
+local replacement_entry = assert(terminal.open(terminal_key, replacement_identity))
+eq(spawn_count, 3, 'identity replacement does not reuse an old attach client')
+running_jobs[after_exit_entry.job] = false
+spawn_exits[after_exit_entry.job](after_exit_entry.job, 0, 'exit')
+vim.wait(20)
+assert(terminal.is_open(terminal_key) and vim.api.nvim_buf_is_valid(replacement_entry.buf), 'stale exit callback does not clean the replacement client')
+eq(stops, stopped_before_replace, 'terminal client replacement does not stop the Herdr agent')
+terminal.hide(terminal_key)
+running_jobs[replacement_entry.job] = false
+spawn_exits[replacement_entry.job](replacement_entry.job, 0, 'exit')
+vim.wait(20)
+
+herdr.resolve = previous_runtime.resolve
+herdr.start = previous_runtime.start
+herdr.send = previous_runtime.send
+herdr.stop = previous_runtime.stop
+vim.env.HERDR_SOCKET_PATH = previous_socket
+
 vim.fn.delete(root, 'rf')
 print('agent-board checks passed')
