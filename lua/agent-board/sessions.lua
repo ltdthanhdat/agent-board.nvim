@@ -10,7 +10,7 @@ function M.list(repo,callback)
         local discovery={sessions={},warnings=warnings,runtime_error=runtime_error}
         local by_id={}
         for _,record in ipairs(records) do
-          local row={conversation=record.conversation,title=record.title,updated_at=record.updated_at,state=runtime_error and 'unknown' or (record.resumable and 'offline' or 'unavailable'),reason=record.reason}
+          local row={conversation=record.conversation,title=record.title,updated_at=record.updated_at,state=runtime_error and 'unknown' or (record.resumable and 'offline' or 'unavailable'),reason=record.reason,preview=record.preview}
           by_id[record.conversation.session_id]=row
           discovery.sessions[#discovery.sessions+1]=row
         end

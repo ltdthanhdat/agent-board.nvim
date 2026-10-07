@@ -1,6 +1,7 @@
 local api = require('agent-board')
 local tasks = require('agent-board.tasks')
 local herdr = require('agent-board.herdr')
+local session_picker = require('agent-board.session_picker')
 local uv = vim.uv
 local M = {}
 local active
@@ -116,18 +117,39 @@ local function item_detail(state, item)
   return agent.provider .. ' · ' .. (agent_state(state, agent) or 'unknown') .. (agent.provider == 'claude' and ' · resume unavailable' or '')
 end
 
-local function join_cells(cells)
-  local offsets, parts, bytes = {}, {}, 0
+local function join_panels(cells)
+  local offsets, sizes, parts, bytes = {}, {}, {}, 0
   for column, cell in ipairs(cells) do
-    offsets[column] = bytes
+    offsets[column], sizes[column] = bytes, #cell
     parts[#parts + 1] = cell
     bytes = bytes + #cell
     if column < #cells then
-      parts[#parts + 1] = ' │ '
-      bytes = bytes + #' │ '
+      parts[#parts + 1] = '  '
+      bytes = bytes + 2
     end
   end
-  return table.concat(parts), offsets
+  return table.concat(parts), offsets, sizes
+end
+
+local function join_cells(cells, width)
+  local panels = {}
+  for column, cell in ipairs(cells) do
+    panels[column] = '│ ' .. fit(cell, width) .. ' │'
+  end
+  local line, offsets, sizes = join_panels(panels)
+  local content_offsets = {}
+  for column, offset in ipairs(offsets) do content_offsets[column] = offset + #'│ ' end
+  return line, offsets, content_offsets, sizes
+end
+
+local function panel_border(width, left, right)
+  return left .. string.rep('─', math.max(0, width - 2)) .. right
+end
+
+local function join_borders(count, width, left, right)
+  local cells = {}
+  for column = 1, count do cells[column] = panel_border(width, left, right) end
+  return join_panels(cells)
 end
 
 local function build_project_views(state)
@@ -189,8 +211,9 @@ local function render(state)
     or vim.o.columns
   local narrow = window_width < 64
   local visible_count = narrow and 1 or 3
-  local available_width = math.max(14, window_width - 6)
-  local width = narrow and available_width or math.max(12, math.floor((available_width - 6) / 3))
+  local board_width = math.max(12, window_width - 2)
+  local panel_width = narrow and board_width or math.max(12, math.floor((board_width - 4) / 3))
+  local width = math.max(8, panel_width - 4)
   local labels = repo_labels(state.projects or {})
   local lines, line_map, row_offsets, highlights, project_render = {}, {}, {}, {}, {}
   local line_groups = {}
@@ -201,16 +224,17 @@ local function render(state)
   end
 
   local scope_label = state.scope == 'global' and 'global' or ('repo ' .. state.repo)
-  append('AgentBoard · ' .. scope_label, 'AgentBoardTitle')
-  if state.error then append('Error: ' .. state.error, 'DiagnosticError') end
-  if state.runtime_error then append('Herdr runtime unavailable', 'DiagnosticWarn') end
+  append('╭' .. fit(' ◆ AgentBoard · ' .. scope_label .. ' ', board_width - 2) .. '╮', 'AgentBoardTitle')
+  if state.error then append(fit('Error: ' .. state.error, board_width), 'DiagnosticError') end
+  if state.runtime_error then append(fit('Herdr runtime unavailable', board_width), 'DiagnosticWarn') end
   for _, warning in ipairs(state.warnings or {}) do
-    append('Warning: ' .. warning.repo .. ' · ' .. warning.error, 'DiagnosticWarn')
+    append(fit('Warning: ' .. warning.repo .. ' · ' .. warning.error, board_width), 'DiagnosticWarn')
   end
-  if #state.project_views == 0 then append('No registered projects. Open a repository with :AgentBoard first.', 'Comment') end
+  if #state.project_views == 0 then append(fit('No registered projects. Open a repository with :AgentBoard first.', board_width), 'Comment') end
 
   for project_index, project_view in ipairs(state.project_views) do
     if not narrow or project_index == state.focus_project then
+      if #lines > 1 then append('') end
       local project = project_view.project
       append('Project · ' .. labels[project.repo], 'AgentBoardProject')
       local lane_count = #project_view.lanes
@@ -219,32 +243,38 @@ local function render(state)
       local shown_count = math.min(visible_count, lane_count)
       local start_lane = narrow and focus_lane or math.max(1, math.min(focus_lane - math.floor(visible_count / 2), lane_count - shown_count + 1))
       local lane_cells, shown_lanes = {}, {}
+      local project_task_count = 0
+      for _, lane in ipairs(project_view.lanes) do project_task_count = project_task_count + #lane.rows end
       for column = 1, shown_count do
         local lane_index = start_lane + column - 1
         local lane_view = project_view.lanes[lane_index]
         shown_lanes[column] = { index = lane_index, view = lane_view }
-        lane_cells[column] = fit(lane_view.lane.name .. ' (' .. #lane_view.rows .. ')', width)
+        local marker = lane_index == focus_lane and '▸ ' or '  '
+        lane_cells[column] = marker .. lane_view.lane.name .. ' (' .. #lane_view.rows .. ')'
       end
-      local heading_line, heading_offsets = join_cells(lane_cells)
+      local top_line, top_offsets, top_sizes = join_borders(shown_count, panel_width, '╭', '╮')
+      local top_row = append(top_line, 'AgentBoardLaneBorder')
+      local heading_line, heading_cell_offsets, heading_offsets, heading_sizes = join_cells(lane_cells, width)
       local heading_row = append(heading_line, 'AgentBoardLane')
       row_offsets[heading_row] = heading_offsets
+      local lane_divider, lane_divider_offsets, lane_divider_sizes = join_borders(shown_count, panel_width, '├', '┤')
+      local lane_divider_row = append(lane_divider, 'AgentBoardLaneBorder')
+      for column, item in ipairs(shown_lanes) do
+        if project_index == state.focus_project and item.index == focus_lane then
+          highlights[#highlights + 1] = { row = top_row, first = top_offsets[column], last = top_offsets[column] + top_sizes[column], group = 'AgentBoardLaneFocus' }
+          highlights[#highlights + 1] = { row = heading_row, first = heading_cell_offsets[column], last = heading_cell_offsets[column] + heading_sizes[column], group = 'AgentBoardLaneFocus' }
+          highlights[#highlights + 1] = { row = lane_divider_row, first = lane_divider_offsets[column], last = lane_divider_offsets[column] + lane_divider_sizes[column], group = 'AgentBoardLaneFocus' }
+        end
+      end
       local card_lines = {}
       for column = 1, shown_count do card_lines[column] = {} end
       local card_count = 0
-      local project_task_count = 0
-      for _, lane in ipairs(project_view.lanes) do project_task_count = project_task_count + #lane.rows end
       for _, item in ipairs(shown_lanes) do card_count = math.max(card_count, #item.view.rows) end
       if card_count == 0 then
         local empty = {}
-        for column = 1, shown_count do empty[column] = fit('(empty)', width) end
-        local empty_line_text = join_cells(empty)
-        local empty_line = append(empty_line_text, 'Comment')
-        if project_task_count == 0 then
-          local message = narrow
-            and 'No tasks · n creates a task; + adds a lane'
-            or 'No tasks · press n to create a task or + to add a lane'
-          lines[empty_line] = fit(message, width * shown_count + 3 * (shown_count - 1))
-        end
+        for column = 1, shown_count do empty[column] = project_task_count == 0 and column == 1 and 'No tasks · n new · + lane' or '— empty —' end
+        local empty_line_text = join_cells(empty, width)
+        append(empty_line_text, 'Comment')
       end
       for index = 1, card_count do
         local title_cells, detail_cells, visible_items = {}, {}, {}
@@ -252,16 +282,17 @@ local function render(state)
           local row = item.view.rows[index]
           visible_items[column] = row
           if row then
-            title_cells[column] = fit(row.task.title, width)
-            detail_cells[column] = fit(item_detail(state, row), width)
+            local selected = ref_key(row.repo, row.task.id) == state.selected
+            title_cells[column] = (selected and '▶ ' or '  ') .. row.task.title
+            detail_cells[column] = item_detail(state, row) ~= '' and item_detail(state, row) or 'no linked session'
           else
             title_cells[column], detail_cells[column] = string.rep(' ', width), string.rep(' ', width)
           end
         end
-        local title_line, title_offsets = join_cells(title_cells)
+        local title_line, title_cell_offsets, title_offsets, title_sizes = join_cells(title_cells, width)
         local title_row = append(title_line, 'AgentBoardCard')
         row_offsets[title_row] = title_offsets
-        local detail_line, detail_offsets = join_cells(detail_cells)
+        local detail_line, detail_cell_offsets, detail_offsets, detail_sizes = join_cells(detail_cells, width)
         local detail_row = append(detail_line, 'Comment')
         row_offsets[detail_row] = detail_offsets
         for column = 1, shown_count do
@@ -272,12 +303,28 @@ local function render(state)
             line_map[title_row][column], line_map[detail_row][column] = row, row
             card_lines[column][index] = title_row
             if ref_key(row.repo, row.task.id) == state.selected then
-              local first = title_offsets[column]
-              local last = first + #title_cells[column]
+              local first = title_cell_offsets[column]
+              local last = first + title_sizes[column]
               highlights[#highlights + 1] = { row = title_row, first = first, last = last, group = 'AgentBoardSelected' }
-              highlights[#highlights + 1] = { row = detail_row, first = detail_offsets[column], last = detail_offsets[column] + #detail_cells[column], group = 'AgentBoardSelected' }
+              highlights[#highlights + 1] = { row = detail_row, first = detail_cell_offsets[column], last = detail_cell_offsets[column] + detail_sizes[column], group = 'AgentBoardSelected' }
             end
           end
+        end
+        if index < card_count then
+          local divider, divider_offsets, divider_sizes = join_borders(shown_count, panel_width, '├', '┤')
+          local divider_row = append(divider, 'AgentBoardLaneBorder')
+          for column, item in ipairs(shown_lanes) do
+            if project_index == state.focus_project and item.index == focus_lane then
+              highlights[#highlights + 1] = { row = divider_row, first = divider_offsets[column], last = divider_offsets[column] + divider_sizes[column], group = 'AgentBoardLaneFocus' }
+            end
+          end
+        end
+      end
+      local bottom_line, bottom_offsets, bottom_sizes = join_borders(shown_count, panel_width, '╰', '╯')
+      local bottom_row = append(bottom_line, 'AgentBoardLaneBorder')
+      for column, item in ipairs(shown_lanes) do
+        if project_index == state.focus_project and item.index == focus_lane then
+          highlights[#highlights + 1] = { row = bottom_row, first = bottom_offsets[column], last = bottom_offsets[column] + bottom_sizes[column], group = 'AgentBoardLaneFocus' }
         end
       end
       project_render[project.repo] = {
@@ -312,7 +359,7 @@ local function render(state)
       and 'n new · + lane · R rename · m move · h/l lanes · [ ] projects · ? help · q close'
       or 'n new · + lane · R rename · m move · h/l lanes · ? help · q close'
   end
-  append(fit(footer, math.max(10, window_width - 4)), 'AgentBoardFooter')
+  append('╰' .. fit(' ' .. footer .. ' ', board_width - 2) .. '╯', 'AgentBoardFooter')
   state.line_map, state.row_offsets, state.project_render, state.highlights = line_map, row_offsets, project_render, highlights
   vim.bo[state.buf].modifiable = true
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
@@ -503,7 +550,12 @@ local function action_bind(state)
     if not discovery then return notify(show_error(err)) end
     for _, warning in ipairs(discovery.warnings) do notify(warning) end
     if discovery.runtime_error then notify('Herdr runtime unknown; opening requires a successful runtime check') end
-    choose(discovery.sessions, 'Link session:', function(session)
+    if #discovery.sessions==0 then return notify('nothing to select') end
+    session_picker.open(discovery.sessions, {prompt='Link session:',format_item=function(session)
+      local provider = session.conversation and 'claude' or session.agent.identity.provider
+      return table.concat({provider, session.title, session.updated_at or '', session.state,
+        session.bound and ('already linked: ' .. session.bound_title) or (session.reason or '')}, ' · ')
+    end}, function(session)
       if not session or not current(state) then return end
       if session.bound then return notify('this session is already linked to a task') end
       if session.state == 'unavailable' or session.ambiguous then return notify(session.reason or 'Session unavailable') end
@@ -513,10 +565,6 @@ local function action_bind(state)
       elseif session.agent then
         api.bind_agent(ref, session.agent.identity, state.snapshots[ref.repo], callback)
       end
-    end, function(session)
-      local provider = session.conversation and 'claude' or session.agent.identity.provider
-      return table.concat({provider, session.title, session.updated_at or '', session.state,
-        session.bound and ('already linked: ' .. session.bound_title) or (session.reason or '')}, ' · ')
     end)
   end)
 end

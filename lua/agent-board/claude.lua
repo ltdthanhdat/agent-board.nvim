@@ -124,6 +124,128 @@ parse_value=function(data,pos,capture,depth)
   return nil,nil,nil
 end
 
+local function utf8_char(codepoint)
+  if codepoint<0x80 then return string.char(codepoint) end
+  if codepoint<0x800 then return string.char(0xC0+math.floor(codepoint/0x40),0x80+codepoint%0x40) end
+  if codepoint<0x10000 then return string.char(0xE0+math.floor(codepoint/0x1000),0x80+math.floor(codepoint/0x40)%0x40,0x80+codepoint%0x40) end
+  return string.char(0xF0+math.floor(codepoint/0x40000),0x80+math.floor(codepoint/0x1000)%0x40,0x80+math.floor(codepoint/0x40)%0x40,0x80+codepoint%0x40)
+end
+
+local function preview_string(data,pos)
+  local after=string_end(data,pos)
+  if not after then return nil,nil end
+  local result,bytes,i={},0,pos+1
+  local limit=1197
+  while i<after-1 and bytes<limit do
+    local byte=data:byte(i)
+    local value,step
+    if byte==92 then
+      local escape=data:sub(i+1,i+1)
+      if escape=='u' then
+        local codepoint=tonumber(data:sub(i+2,i+5),16)
+        step=6
+        if codepoint>=0xD800 and codepoint<=0xDBFF and data:sub(i+6,i+7)=='\\u' then
+          local low=tonumber(data:sub(i+8,i+11),16)
+          if low and low>=0xDC00 and low<=0xDFFF then codepoint=0x10000+(codepoint-0xD800)*0x400+(low-0xDC00);step=12 end
+        end
+        if codepoint>=0xD800 and codepoint<=0xDFFF then codepoint=0xFFFD end
+        value=utf8_char(codepoint)
+      else
+        value=({['"']='"',['\\']='\\',['/']='/',b=' ',f=' ',n=' ',r=' ',t=' '})[escape] or ' '
+        step=2
+      end
+    else
+      step=byte<0x80 and 1 or (byte<0xE0 and 2 or (byte<0xF0 and 3 or 4))
+      value=data:sub(i,i+step-1)
+    end
+    if bytes+#value>limit then break end
+    result[#result+1]=value
+    bytes=bytes+#value
+    i=i+step
+  end
+  if i<after-1 then result[#result+1]='…' end
+  return table.concat(result),after
+end
+
+local function parse_text_block(data,pos)
+  if data:sub(pos,pos)~='{' then return nil,nil end
+  local kind,text
+  pos=whitespace(data,pos+1)
+  if data:sub(pos,pos)=='}' then return nil,pos+1 end
+  while true do
+    local key_after=string_end(data,pos)
+    if not key_after then return nil,nil end
+    local key=preview_string(data,pos)
+    pos=whitespace(data,key_after)
+    if data:sub(pos,pos)~=':' then return nil,nil end
+    local value_pos=whitespace(data,pos+1)
+    local after
+    if (key=='type' or key=='text') and data:sub(value_pos,value_pos)=='"' then
+      local value
+      value,after=preview_string(data,value_pos)
+      if key=='type' then kind=value else text=value end
+    else
+      local _,parsed=parse_value(data,value_pos,false,1)
+      after=parsed
+    end
+    if not after then return nil,nil end
+    pos=whitespace(data,after)
+    local delimiter=data:sub(pos,pos)
+    if delimiter=='}' then return kind=='text' and text or nil,pos+1 end
+    if delimiter~=',' then return nil,nil end
+    pos=whitespace(data,pos+1)
+  end
+end
+
+local function parse_content(data,pos)
+  local char=data:sub(pos,pos)
+  if char=='"' then return preview_string(data,pos) end
+  if char~='[' then local _,after=parse_value(data,pos,false,1);return nil,after end
+  local texts={}
+  pos=whitespace(data,pos+1)
+  if data:sub(pos,pos)==']' then return nil,pos+1 end
+  while true do
+    local value,after
+    if data:sub(pos,pos)=='{' then value,after=parse_text_block(data,pos)
+    else local _,parsed=parse_value(data,pos,false,1);after=parsed end
+    if not after then return nil,nil end
+    if value and value~='' then texts[#texts+1]=value end
+    pos=whitespace(data,after)
+    local delimiter=data:sub(pos,pos)
+    if delimiter==']' then
+      local joined=table.concat(texts,' ')
+      return joined~='' and joined or nil,pos+1
+    end
+    if delimiter~=',' then return nil,nil end
+    pos=whitespace(data,pos+1)
+  end
+end
+
+local function parse_message(data,pos)
+  if data:sub(pos,pos)~='{' then local _,after=parse_value(data,pos,false,1);return nil,after end
+  local content
+  pos=whitespace(data,pos+1)
+  if data:sub(pos,pos)=='}' then return nil,pos+1 end
+  while true do
+    local key_after=string_end(data,pos)
+    if not key_after then return nil,nil end
+    local key=preview_string(data,pos)
+    pos=whitespace(data,key_after)
+    if data:sub(pos,pos)~=':' then return nil,nil end
+    local value_pos=whitespace(data,pos+1)
+    local after,value
+    if key=='content' then value,after=parse_content(data,value_pos)
+    else local _,parsed=parse_value(data,value_pos,false,1);after=parsed end
+    if not after then return nil,nil end
+    if key=='content' then content=value end
+    pos=whitespace(data,after)
+    local delimiter=data:sub(pos,pos)
+    if delimiter=='}' then return content,pos+1 end
+    if delimiter~=',' then return nil,nil end
+    pos=whitespace(data,pos+1)
+  end
+end
+
 local function parse_metadata(data)
   local pos=whitespace(data,1)
   if data:sub(pos,pos)~='{' then return nil end
@@ -141,9 +263,12 @@ local function parse_metadata(data)
     pos=whitespace(data,key_after)
     if data:sub(pos,pos)~=':' then return nil end
     local wanted=key and captured_keys[key]
-    local value,after,kind=parse_value(data,pos+1,wanted,1)
+    local value,after,kind
+    if key=='message' then value,after=parse_message(data,whitespace(data,pos+1));kind='object'
+    else value,after,kind=parse_value(data,pos+1,wanted,1) end
     if not after then return nil end
     if wanted and ((kind=='string' and type(value)=='string') or (key=='isSidechain' and kind=='boolean')) then result[key]=value end
+    if key=='message' then result.preview_text=value end
     pos=whitespace(data,after)
     local delimiter=data:sub(pos,pos)
     if delimiter=='}' then
@@ -152,6 +277,18 @@ local function parse_metadata(data)
     end
     if delimiter~=',' then return nil end
     pos=whitespace(data,pos+1)
+  end
+end
+
+local function merge_preview(record, role, text, timestamp)
+  if (role~='user' and role~='assistant') or type(text)~='string' then return end
+  text=text:gsub('[%z\1-\31\127]+',' '):gsub('%s+',' '):gsub('^%s+',''):gsub('%s+$','')
+  if text=='' then return end
+  record.preview=record.preview or {}
+  local current=record.preview[role]
+  timestamp=type(timestamp)=='string' and timestamp or ''
+  if not current or timestamp=='' or not current.timestamp or timestamp>=current.timestamp then
+    record.preview[role]={text=text,timestamp=timestamp}
   end
 end
 
@@ -175,6 +312,7 @@ local function scan_file(path, callback)
         if type(row.cwd)=='string' and row.cwd:sub(1,1)=='/' then record.conversation.cwd=row.cwd end
         if row.type=='ai-title' and type(row.aiTitle)=='string' and row.aiTitle~='' then record.title=row.aiTitle end
         if type(row.timestamp)=='string' and row.timestamp:match('^%d%d%d%d%-%d%d%-%d%dT') and (not record.updated_at or row.timestamp>record.updated_at) then record.updated_at=row.timestamp end
+        merge_preview(record,row.type,row.preview_text,row.timestamp)
       end
       local function finish()
         if pending~='' and not discard then line(pending) end
@@ -262,6 +400,13 @@ function M.list(repo, callback)
                   if r.conversation.cwd then old.conversation.cwd=r.conversation.cwd end
                   if r.title~=id then old.title=r.title end
                   if r.updated_at and (not old.updated_at or r.updated_at>old.updated_at) then old.updated_at=r.updated_at end
+                  for role,message in pairs(r.preview or {}) do
+                    old.preview=old.preview or {}
+                    local current=old.preview[role]
+                    if not current or not message.timestamp or not current.timestamp or message.timestamp>=current.timestamp then
+                      old.preview[role]=message
+                    end
+                  end
                 end
               end
               next_file()

@@ -128,6 +128,25 @@ local function press(key)
   vim.wait(20)
 end
 
+local function picker_windows()
+  local list_win, preview_win
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local buf = vim.api.nvim_win_get_buf(win)
+    if vim.b[buf].agent_board_session_picker then list_win = win end
+    if vim.b[buf].agent_board_session_preview then preview_win = win end
+  end
+  return list_win, preview_win
+end
+
+local function wait_for_picker()
+  return vim.wait(10000, function() return picker_windows() ~= nil end)
+end
+
+local function accept_picker(index)
+  for _ = 2, index do press('j') end
+  press('<CR>')
+end
+
 local function task_from(repo, id)
   return assert(tasks.get_task({ repo = repo, id = id }))
 end
@@ -228,8 +247,9 @@ input_responses[#input_responses + 1] = 'Bind task'
 press('n')
 local bind_rows = assert(tasks.list_tasks({ scope = 'repo', repo = repo_a }))
 local bind_task_id = bind_rows[#bind_rows].task.id
-select_responses[#select_responses + 1] = choose(existing_identity.pane_id)
 press('b')
+assert(wait_for_picker(), 'live session picker timeout')
+accept_picker(1)
 assert(vim.wait(10000,function() return task_from(repo_a,bind_task_id).agent~=vim.NIL end),'live picker bind timeout')
 local bound_task = task_from(repo_a, bind_task_id)
 eq(bound_task.agent.terminal_id, existing_identity.terminal_id, 'b links the selected existing agent')
@@ -238,10 +258,11 @@ eq(bound_task.status, 'todo', 'binding through the UI leaves the task in Todo')
 input_responses[#input_responses + 1] = 'Duplicate binding task'
 press('n')
 local duplicate_bind_id = row_ids(repo_a)[3]
-select_responses[#select_responses + 1] = choose(existing_identity.pane_id)
 local saved_notify, notifications = vim.notify, {}
 vim.notify = function(message) notifications[#notifications + 1] = tostring(message) end
 press('b')
+assert(wait_for_picker(), 'duplicate session picker timeout')
+accept_picker(1)
 assert(vim.wait(10000,function() return #notifications>0 end),'duplicate warning timeout')
 vim.notify = saved_notify
 eq(task_from(repo_a, duplicate_bind_id).agent, vim.NIL, 'binding an already-linked agent leaves the second task unlinked')
@@ -484,21 +505,28 @@ local native_id='12345678-1234-4234-8234-123456789abc'
 vim.env.CLAUDE_CONFIG_DIR=root..'/claude'
 vim.fn.mkdir(root..'/claude/projects/repo','p')
 local history=assert(io.open(root..'/claude/projects/repo/'..native_id..'.jsonl','w'))
-history:write(vim.json.encode({type='user',sessionId=native_id,cwd=repo_a,timestamp='2026-10-07T00:00:00Z'}),'\n')
+history:write(vim.json.encode({type='user',sessionId=native_id,cwd=repo_a,timestamp='2026-10-07T00:00:00Z',message={content='Old session prompt preview'}}),'\n')
+history:write(vim.json.encode({type='assistant',sessionId=native_id,cwd=repo_a,timestamp='2026-10-07T00:30:00Z',message={content={{type='text',text='Old assistant response preview'}}}}),'\n')
 history:write(vim.json.encode({type='ai-title',sessionId=native_id,aiTitle='Offline fixture'}),'\n');history:close()
+local newer_id='22345678-1234-4234-8234-123456789abc'
+local newer=assert(io.open(root..'/claude/projects/repo/'..newer_id..'.jsonl','w'))
+newer:write(vim.json.encode({type='user',sessionId=newer_id,cwd=repo_a,timestamp='2026-10-07T02:00:00Z',message={content='Newer session preview content'}}),'\n');newer:close()
 input_responses[#input_responses+1]='Offline linked task'
 press('n')
 local offline_rows=assert(tasks.list_tasks({scope='repo',repo=repo_a}))
 local offline_id=offline_rows[#offline_rows].task.id
 local before_bind_starts=starts
-select_responses[#select_responses+1]=function(items,opts)
-  for _,row in ipairs(items) do if row.conversation and row.conversation.session_id==native_id then
-    contains(opts.format_item(row),'Offline fixture');contains(opts.format_item(row),'offline');contains(opts.format_item(row),'2026-10-07')
-    return row
-  end end
-  error('offline Claude session missing from picker')
-end
 press('b')
+assert(wait_for_picker(), 'offline session picker timeout')
+local picker_list_win, picker_preview_win = picker_windows()
+assert(picker_list_win and picker_preview_win, 'session picker must show list and preview panes')
+local picker_list_buf = vim.api.nvim_win_get_buf(picker_list_win)
+local picker_preview_buf = vim.api.nvim_win_get_buf(picker_preview_win)
+contains(table.concat(vim.api.nvim_buf_get_lines(picker_list_buf,0,-1,false),'\n'),'Offline fixture')
+contains(table.concat(vim.api.nvim_buf_get_lines(picker_preview_buf,0,-1,false),'\n'),'Newer session preview content')
+press('j')
+contains(table.concat(vim.api.nvim_buf_get_lines(picker_preview_buf,0,-1,false),'\n'),'Old assistant response preview')
+accept_picker(1)
 assert(vim.wait(10000,function() return task_from(repo_a,offline_id).conversation~=vim.NIL end),'offline picker binding')
 eq(starts,before_bind_starts,'picker binds without launching')
 board.refresh();vim.wait(50)

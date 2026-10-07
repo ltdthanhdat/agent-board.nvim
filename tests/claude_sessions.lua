@@ -15,7 +15,11 @@ end
 local rows = {
   {type='user',sessionId=id,cwd=repo,timestamp='2026-10-07T00:00:00Z',message={content=string.rep('PRIVATE FIXTURE ',35000)}},
   {type='ai-title',sessionId=id,aiTitle='Saved task'},
-  {type='assistant',sessionId=id,cwd=repo,timestamp='2026-10-07T01:00:00Z'},
+  {type='assistant',sessionId=id,cwd=repo,timestamp='2026-10-07T01:00:00Z',message={content={
+    {type='thinking',thinking='hidden reasoning'},
+    {type='tool_use',name='bash'},
+    {type='text',text='Preview answer from assistant'},
+  }}},
   {type='user',sessionId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',cwd=repo,isSidechain=true},
 }
 write(rows, '{broken')
@@ -41,6 +45,9 @@ assert(#records == 1, 'metadata_scan: consolidate main session only')
 assert(records[1].title == 'Saved task' and records[1].conversation.cwd == repo)
 assert(records[1].updated_at == '2026-10-07T01:00:00Z' and records[1].resumable)
 assert(records[1].conversation.session_id == id, 'partial_record: valid preceding records retained')
+assert(records[1].preview.user.text:match('^PRIVATE FIXTURE'), 'long user text has a bounded preview')
+assert(#records[1].preview.user.text <= 1201, 'user preview stays within its size limit')
+assert(records[1].preview.assistant.text == 'Preview answer from assistant', 'assistant preview excludes thinking and tool blocks')
 rows[#rows+1] = {type='ai-title',sessionId=id,aiTitle='Updated task'}
 write(rows)
 assert(list()[1].title == 'Updated task','cache_invalidation')
