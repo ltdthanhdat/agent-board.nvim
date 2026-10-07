@@ -342,6 +342,7 @@ release_invalid()
 local release_after_error = assert(storage.lock(board_path))
 release_after_error()
 
+local function check_lifecycle_and_board()
 local api = require('agent-board')
 for _, name in ipairs({ 'start_agent', 'bind_agent', 'open_agent', 'hide_agent', 'send', 'stop_agent' }) do
   assert(type(api[name]) == 'function', 'public lifecycle API is missing: ' .. name)
@@ -556,12 +557,15 @@ assert(tasks.register_repo(corrupt_registered))
 write(corrupt_registered .. '/.agent-board.json', '{broken json')
 local corrupt_identity = identity_for('term-corrupt', 'task4:corrupt')
 live_agents[corrupt_identity.pane_id] = live_for(corrupt_identity)
+local corrupt_board_path = corrupt_registered .. '/.agent-board.json'
+local corrupt_bytes = read_bytes(corrupt_board_path)
 local failed_closed_corrupt, corrupt_error = await(function(callback)
   api.bind_agent({ repo = task4_repo_a, id = concurrent_b.id }, corrupt_identity, callback)
 end)
 assert(failed_closed_corrupt == nil and corrupt_error and corrupt_error.code == 'board_unavailable', 'corrupt registered repo fails closed during uniqueness scan')
+eq(read_bytes(corrupt_board_path), corrupt_bytes, 'failed binding leaves corrupt board bytes untouched')
 
-local fake_jobs, running_jobs, spawn_count, spawn_exits = {}, {}, 0, {}
+local fake_jobs, running_jobs, spawn_count, spawn_exits, local_stops = {}, {}, 0, {}, 0
 terminal.spawn_term = function(argv, on_exit)
   spawn_count = spawn_count + 1
   local job = spawn_count
@@ -571,6 +575,10 @@ terminal.spawn_term = function(argv, on_exit)
   return job
 end
 terminal.job_running = function(job) return running_jobs[job] == true end
+terminal.stop_term = function(job)
+  local_stops = local_stops + 1
+  running_jobs[job] = false
+end
 local terminal_key = 'task4-terminal-key'
 local first_terminal_identity = identity_for('term-terminal-1', 'task4:terminal-1', 'terminal-one', 'session-one')
 local first_entry = assert(terminal.open(terminal_key, first_terminal_identity))
@@ -602,16 +610,24 @@ spawn_exits[after_exit_entry.job](after_exit_entry.job, 0, 'exit')
 vim.wait(20)
 assert(terminal.is_open(terminal_key) and vim.api.nvim_buf_is_valid(replacement_entry.buf), 'stale exit callback does not clean the replacement client')
 eq(stops, stopped_before_replace, 'terminal client replacement does not stop the Herdr agent')
+eq(local_stops, 1, 'replacement stops only the old local attach client')
 terminal.hide(terminal_key)
 running_jobs[replacement_entry.job] = false
 spawn_exits[replacement_entry.job](replacement_entry.job, 0, 'exit')
 vim.wait(20)
+
+local board = require('agent-board.board')
+assert(type(board.open) == 'function' and type(board.close) == 'function' and type(board.refresh) == 'function', 'board UI API is missing')
+assert(type(api.focus_board) == 'function', 'public focus_board API is missing')
 
 herdr.resolve = previous_runtime.resolve
 herdr.start = previous_runtime.start
 herdr.send = previous_runtime.send
 herdr.stop = previous_runtime.stop
 vim.env.HERDR_SOCKET_PATH = previous_socket
+end
+
+check_lifecycle_and_board()
 
 vim.fn.delete(root, 'rf')
 print('agent-board checks passed')

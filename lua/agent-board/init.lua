@@ -26,6 +26,10 @@ for _, name in ipairs({ 'open_agent', 'hide_agent', 'send', 'stop_agent' }) do
   M[name] = tasks[name]
 end
 
+function M.focus_board(opts)
+  return require('agent-board.board').open(opts)
+end
+
 function M.setup(opts)
   if opts ~= nil and type(opts) ~= 'table' then
     return nil, 'setup options must be a table'
