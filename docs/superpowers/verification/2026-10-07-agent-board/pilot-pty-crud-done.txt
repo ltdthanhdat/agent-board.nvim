@@ -1,0 +1,40 @@
+ [No Name]  [Scratch]                                                                                                  X
+po /tmp/agent-board-pty.jFr98G/repo
+                        │ Doing                                  │ Done
+                        │                                        │ PTY rename check 🔐
+                        │                                        │ codex · working
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+[Scratch] [-]                                                                                         3,87-83        All
+Rename task: PTY rename check 🔐

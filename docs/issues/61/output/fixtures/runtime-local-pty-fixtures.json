@@ -1,0 +1,27 @@
+{
+  "scope": "local-pty",
+  "status": "passed-and-cleaned",
+  "temporary_root": "/tmp/agent-board-issue61-retest-AD4A7P",
+  "repositories": [
+    { "path": "/tmp/agent-board-issue61-retest-AD4A7P/repos/one/same-name", "git": true, "registered": true },
+    { "path": "/tmp/agent-board-issue61-retest-AD4A7P/repos/two/same-name", "git": true, "registered": true }
+  ],
+  "runtime": {
+    "provider": "codex",
+    "adapter": "fake Herdr CLI fixture",
+    "server_route": "socket:/tmp/agent-board-issue61-retest-AD4A7P/herdr.sock",
+    "terminal_id": "term-pty",
+    "pane_id": "w1:p1",
+    "agent_session_id": "session-pty",
+    "attach_process_count_after_hide_and_reopen": 1,
+    "attach_stdin_input": "SAFE_INPUT_61",
+    "prompt_sent_via_board_key_p": "Harmless fixture prompt",
+    "live_herdr_server_or_provider": false
+  },
+  "terminal": {
+    "normal_size": "120x40",
+    "narrow_size": "36x16",
+    "recorder": "tmux capture-pane text; no image/video recorder installed"
+  },
+  "cleanup": "Both isolated tmux servers and temporary fixture roots were removed after evidence capture; no user Herdr server or session was accessed."
+}

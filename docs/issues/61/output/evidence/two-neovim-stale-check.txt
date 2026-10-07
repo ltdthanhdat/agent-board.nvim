@@ -1,0 +1,4 @@
+Neovim A rejected stale snapshot with reload-required error
+Neovim B saved a newer task revision
+board changed; reload before saving
+{"revision":1,"tasks":[{"agent":null,"title":"Fresh update from Neovim B","id":"stale-test","status":"todo"}],"version":1}
