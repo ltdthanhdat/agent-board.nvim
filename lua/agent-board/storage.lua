@@ -5,9 +5,17 @@ local function failure(message)
   return nil, message
 end
 
+local function default_lanes()
+  return {
+    { id = 'todo', name = 'Todo' },
+    { id = 'doing', name = 'Doing' },
+    { id = 'done', name = 'Done' },
+  }
+end
+
 local function document_template(kind)
   if kind == 'board' then
-    return { version = 2, revision = 0, tasks = {} }
+    return { version = 3, revision = 0, tasks = {}, lanes = default_lanes() }
   end
   if kind == 'registry' then
     return { version = 1, revision = 0, repos = {} }
@@ -49,13 +57,44 @@ local function validate_agent(agent)
 end
 
 local function validate(document, kind)
-  if type(document) ~= 'table' or not valid_revision(document.revision) or (document.version ~= 1 and not (kind == 'board' and document.version == 2)) then
+  if type(document) ~= 'table' then
+    return false, 'document version or revision is invalid'
+  end
+  local valid_version = kind == 'board'
+    and (document.version == 1 or document.version == 2 or document.version == 3)
+    or kind == 'registry' and document.version == 1
+  if not valid_revision(document.revision) or not valid_version then
     return false, 'document version or revision is invalid'
   end
 
   if kind == 'board' then
     if type(document.tasks) ~= 'table' or not vim.islist(document.tasks) then
       return false, 'tasks must be an array'
+    end
+    local lanes, lane_names = {}, {}
+    if document.version == 3 then
+      if type(document.lanes) ~= 'table' or not vim.islist(document.lanes) or #document.lanes == 0 then
+        return false, 'lanes must be a non-empty array'
+      end
+      for _, lane in ipairs(document.lanes) do
+        if type(lane) ~= 'table' or not valid_string(lane.id) or type(lane.name) ~= 'string' then
+          return false, 'each lane needs a non-empty id and a name'
+        end
+        local name = lane.name:match('^%s*(.-)%s*$')
+        if name == '' then
+          return false, 'lane name must be non-empty'
+        end
+        if lanes[lane.id] then
+          return false, 'lane IDs must be unique'
+        end
+        if lane_names[name] then
+          return false, 'lane names must be unique'
+        end
+        lanes[lane.id] = true
+        lane_names[name] = true
+      end
+    else
+      lanes = { todo = true, doing = true, done = true }
     end
     local ids = {}
     for _, task in ipairs(document.tasks) do
@@ -66,8 +105,8 @@ local function validate(document, kind)
         return false, 'task IDs must be unique'
       end
       ids[task.id] = true
-      if task.status ~= 'todo' and task.status ~= 'doing' and task.status ~= 'done' then
-        return false, 'task status must be todo, doing, or done'
+      if not lanes[task.status] then
+        return false, 'task status must reference a lane'
       end
       if task.pending_start ~= nil and type(task.pending_start) ~= 'boolean' then
         return false, 'pending_start must be a boolean'
@@ -152,7 +191,8 @@ function M.read(path, kind)
     return failure('invalid ' .. kind .. ' in ' .. path .. ': ' .. validation_error)
   end
   if kind == 'board' then
-    document.version = 2
+    if document.version < 3 then document.lanes = default_lanes() end
+    document.version = 3
     for _, task in ipairs(document.tasks) do task.conversation = task.conversation or vim.NIL end
   end
   return document, { data = data, kind = kind, revision = document.revision }

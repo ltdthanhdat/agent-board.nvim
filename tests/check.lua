@@ -43,27 +43,64 @@ local function task(title)
 end
 
 local board_path = root .. '/.agent-board.json'
+local default_lanes = {
+  { id = 'todo', name = 'Todo' },
+  { id = 'doing', name = 'Doing' },
+  { id = 'done', name = 'Done' },
+}
 local missing, missing_snapshot = storage.read(board_path, 'board')
-eq(missing, { version = 2, revision = 0, tasks = {} }, 'missing board defaults')
+eq(missing, { version = 3, revision = 0, tasks = {}, lanes = default_lanes }, 'missing board defaults')
 assert(missing_snapshot.data == nil, 'missing file snapshot must be distinguishable')
 
 local board = { version = 1, revision = 1, tasks = { task('Sửa lỗi đăng nhập 🔐') } }
 write(board_path, vim.json.encode(board))
 local loaded, snapshot = storage.read(board_path, 'board')
 local normalized = vim.deepcopy(board)
-normalized.version = 2
+normalized.version = 3
+normalized.lanes = default_lanes
 normalized.tasks[1].conversation = vim.NIL
 eq(loaded, normalized, 'v1_normalization_no_write')
 assert(read_bytes(board_path) == snapshot.data, 'v1 read must not rewrite bytes')
-local v2 = vim.deepcopy(normalized)
+local v2 = vim.deepcopy(board)
+v2.version = 2
 v2.tasks[1].conversation = {provider='claude',session_id='12345678-1234-4234-8234-123456789abc',cwd=root}
 write(board_path, vim.json.encode(v2))
-assert(storage.read(board_path,'board'), 'v2_conversation_validation')
+local loaded_v2, v2_snapshot = storage.read(board_path, 'board')
+local normalized_v2 = vim.deepcopy(v2)
+normalized_v2.version = 3
+normalized_v2.lanes = default_lanes
+eq(loaded_v2, normalized_v2, 'v2_normalization_no_write')
+assert(read_bytes(board_path) == v2_snapshot.data, 'v2 read must not rewrite bytes')
 for _, patch in ipairs({{session_id='invalid'},{cwd='relative'},{provider='codex'}}) do
   local bad=vim.deepcopy(v2)
   for k,v in pairs(patch) do bad.tasks[1].conversation[k]=v end
   write(board_path,vim.json.encode(bad))
   assert(storage.read(board_path,'board')==nil,'invalid conversation rejected')
+end
+
+local custom_v3 = {
+  version = 3,
+  revision = 4,
+  lanes = {
+    { id = 'todo', name = 'Todo' },
+    { id = 'doing', name = 'Doing' },
+    { id = 'done', name = 'Done' },
+    { id = 'review', name = 'Review' },
+  },
+  tasks = { task('Custom lane') },
+}
+custom_v3.tasks[1].status = 'review'
+custom_v3.tasks[1].conversation = vim.NIL
+write(board_path, vim.json.encode(custom_v3))
+eq(storage.read(board_path, 'board'), custom_v3, 'version 3 accepts a custom lane')
+for _, invalid in ipairs({
+  (function() local value = vim.deepcopy(custom_v3); value.lanes[4].id = 'todo'; return value end)(),
+  (function() local value = vim.deepcopy(custom_v3); value.lanes[4].name = 'Todo'; return value end)(),
+  (function() local value = vim.deepcopy(custom_v3); value.tasks[1].status = 'missing'; return value end)(),
+}) do
+  write(board_path, vim.json.encode(invalid))
+  local rejected, lane_error = storage.read(board_path, 'board')
+  assert(rejected == nil and lane_error, 'invalid lane definitions and references are rejected')
 end
 write(board_path,vim.json.encode(board))
 assert(type(snapshot.data) == 'string', 'existing snapshot must preserve raw bytes')
@@ -339,7 +376,7 @@ vim.env.HERDR_SOCKET_PATH = previous_socket
 write(board_path, '{broken json')
 local malformed, malformed_err = storage.read(board_path, 'board')
 assert(malformed == nil and malformed_err, 'malformed JSON must be rejected')
-write(board_path, vim.json.encode({ version = 3, revision = 1, tasks = {} }))
+write(board_path, vim.json.encode({ version = 4, revision = 1, tasks = {} }))
 local unsupported, unsupported_err = storage.read(board_path, 'board')
 assert(unsupported == nil and unsupported_err, 'unsupported version must be rejected')
 
@@ -355,7 +392,7 @@ local next_snapshot = assert(storage.write_locked(board_path, current, current_s
 release()
 eq(storage.read(board_path, 'board'), current, 'successful write is visible')
 assert(next_snapshot.revision == 2, 'write increments document revision')
-assert(vim.json.decode(read_bytes(board_path)).version==2,'migration_on_mutation')
+assert(vim.json.decode(read_bytes(board_path)).version==3,'migration_on_mutation')
 assert(storage.read(registry_path,'registry').version==1,'registry_stays_v1')
 assert(current.tasks[1].agent.provider=='codex' and current.tasks[1].conversation==vim.NIL,'legacy_provider_preservation')
 
