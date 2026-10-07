@@ -1,7 +1,7 @@
 local tasks = require('agent-board.tasks')
 local M = {}
 
-for _, name in ipairs({ 'resolve_repo', 'list_tasks', 'get_task', 'create_task', 'update_task', 'move_task', 'delete_task', 'bind_conversation', 'list_sessions' }) do
+for _, name in ipairs({ 'resolve_repo', 'list_tasks', 'list_lanes', 'add_lane', 'rename_lane', 'get_task', 'create_task', 'update_task', 'move_task', 'delete_task', 'bind_conversation', 'list_sessions' }) do
   M[name] = tasks[name]
 end
 

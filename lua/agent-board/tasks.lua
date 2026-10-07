@@ -349,7 +349,7 @@ function M.list_tasks(opts)
     for _, task in ipairs(document.tasks) do
       result[#result + 1] = { repo = root, task = task }
     end
-    return result, {}, { [root] = snapshot }
+    return result, {}, { [root] = snapshot }, { { repo = root, lanes = vim.deepcopy(document.lanes) } }
   end
   if opts.scope ~= 'global' then
     return error_result('scope must be repo or global')
@@ -359,7 +359,7 @@ function M.list_tasks(opts)
   if not registry then
     return error_result(registry_error)
   end
-  local result, warnings, snapshots = {}, {}, {}
+  local result, warnings, snapshots, projects = {}, {}, {}, {}
   for _, registered_root in ipairs(registry.repos) do
     local root, root_error = M.resolve_repo(registered_root)
     if not root then
@@ -372,12 +372,21 @@ function M.list_tasks(opts)
         return error_result(snapshot)
       end
       snapshots[root] = snapshot
+      projects[#projects + 1] = { repo = root, lanes = vim.deepcopy(document.lanes) }
       for _, task in ipairs(document.tasks) do
         result[#result + 1] = { repo = root, task = task }
       end
     end
   end
-  return result, warnings, snapshots
+  return result, warnings, snapshots, projects
+end
+
+function M.list_lanes(repo)
+  local root, root_error = M.resolve_repo(repo)
+  if not root then return error_result(root_error) end
+  local document, read_error = storage.read(board_path(root), 'board')
+  if not document then return error_result(read_error) end
+  return vim.deepcopy(document.lanes)
 end
 
 function M.get_task(ref)
@@ -404,14 +413,16 @@ function M.create_task(opts, expected_snapshot)
   if type(opts) ~= 'table' or type(opts.title) ~= 'string' or trim(opts.title) == '' then
     return error_result('task title must be a non-empty string')
   end
-  local status = opts.status or 'todo'
-  if status ~= 'todo' and status ~= 'doing' and status ~= 'done' then
-    return error_result('task status must be todo, doing, or done')
-  end
   return with_repo_lock(opts.repo, function(root, registry, registry_snapshot, document, snapshot)
     if stale(expected_snapshot, snapshot) then
       return error_result('board changed; reload before saving')
     end
+    local status = opts.status or document.lanes[1].id
+    local valid_status = false
+    for _, lane in ipairs(document.lanes) do
+      if lane.id == status then valid_status = true; break end
+    end
+    if not valid_status then return error_result('task status must reference a lane in this repository') end
     local registry_changed = register_in_document(registry, root)
     local created = { id = new_id(document.tasks), title = trim(opts.title), status = status, agent = vim.NIL, conversation = vim.NIL }
     document.tasks[#document.tasks + 1] = created
@@ -458,13 +469,15 @@ function M.move_task(ref, status, expected_snapshot)
   if not valid_ref then
     return error_result(ref_error)
   end
-  if status ~= 'todo' and status ~= 'doing' and status ~= 'done' then
-    return error_result('task status must be todo, doing, or done')
-  end
   return with_repo_lock(ref.repo, function(root, registry, registry_snapshot, document, snapshot)
     if stale(expected_snapshot, snapshot) then
       return error_result('board changed; reload before saving')
     end
+    local valid_status = false
+    for _, lane in ipairs(document.lanes) do
+      if lane.id == status then valid_status = true; break end
+    end
+    if not valid_status then return error_result('task status must reference a lane in this repository') end
     local index, task = find_task(document, ref.id)
     if not index then
       return error_result('task not found: ' .. ref.id)
@@ -475,6 +488,55 @@ function M.move_task(ref, status, expected_snapshot)
       return error_result(save_error)
     end
     return vim.deepcopy(task)
+  end)
+end
+
+function M.add_lane(repo, name, expected_snapshot)
+  if type(name) ~= 'string' or trim(name) == '' then
+    return error_result('lane name must be a non-empty string')
+  end
+  name = trim(name)
+  return with_repo_lock(repo, function(root, registry, registry_snapshot, document, snapshot)
+    if stale(expected_snapshot, snapshot) then
+      return error_result('board changed; reload before saving')
+    end
+    for _, lane in ipairs(document.lanes) do
+      if trim(lane.name) == name then return error_result('lane name already exists') end
+    end
+    local lane = { id = new_id(document.lanes), name = name }
+    document.lanes[#document.lanes + 1] = lane
+    local registry_changed = register_in_document(registry, root)
+    local saved, save_error = save_changes(root, registry, registry_snapshot, document, snapshot, registry_changed)
+    if not saved then return error_result(save_error) end
+    return vim.deepcopy(lane)
+  end)
+end
+
+function M.rename_lane(repo, lane_id, name, expected_snapshot)
+  if type(lane_id) ~= 'string' or lane_id == '' then
+    return error_result('lane ID must be a non-empty string')
+  end
+  if type(name) ~= 'string' or trim(name) == '' then
+    return error_result('lane name must be a non-empty string')
+  end
+  name = trim(name)
+  return with_repo_lock(repo, function(root, registry, registry_snapshot, document, snapshot)
+    if stale(expected_snapshot, snapshot) then
+      return error_result('board changed; reload before saving')
+    end
+    local selected
+    for _, lane in ipairs(document.lanes) do
+      if lane.id == lane_id then selected = lane; break end
+    end
+    if not selected then return error_result('lane not found: ' .. lane_id) end
+    for _, lane in ipairs(document.lanes) do
+      if lane.id ~= lane_id and trim(lane.name) == name then return error_result('lane name already exists') end
+    end
+    selected.name = name
+    local registry_changed = register_in_document(registry, root)
+    local saved, save_error = save_changes(root, registry, registry_snapshot, document, snapshot, registry_changed)
+    if not saved then return error_result(save_error) end
+    return vim.deepcopy(selected)
   end)
 end
 
