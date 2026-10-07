@@ -130,7 +130,8 @@ Shared types: `Ref={repo:string,id:string}`; `Task` như spec; `ViewTask={repo:s
 - [ ] Implement scratch buffer unmodifiable và line/card hit map, dùng display width cho Unicode, horizontal scrolling trên màn hẹp. Bind mappings đúng spec; `d` gọi move Done, `x` confirm delete, `s` confirm stop **và đóng pane**, `b` chọn agent và ghi rõ already-bound. `n` global chọn repo. Offline open đề nghị start nhưng không tự start. `g` về selected repo hoặc picker nếu không có selected task.
 - [ ] Implement một timer 2 giây chỉ khi visible và query đang không pending; lỗi status giữ task/link, hiện runtime unavailable. UI actions gọi API với snapshot đang hiển thị, conflict nhắc reload. Prompt bằng `vim.ui.input/select`; cancel không mutation. Task creation chọn provider lúc start, không bắt buộc runtime sẵn để CRUD.
 - [ ] Đăng ký command idempotent; thêm README install local/lazy.nvim, requirements, mappings, `.agent-board.json` ownership, registry/lock recovery, stop-pane semantics và public API callback examples. Không có implicit keymaps ngoài board/terminal.
-- [ ] Chạy `nvim --headless -u NONE -l tests/ui_e2e.lua`; kỳ vọng command, keymaps, rendered buffer, repo/global scope và JSON cùng khớp. Mở Neovim trong PTY ở kích thước thường và hẹp để kiểm tra trực tiếp ba cột, cuộn ngang, điều hướng và terminal không nhận nhầm keymap board.
+- [ ] Chạy `nvim --headless -u NONE -l tests/ui_e2e.lua`; kỳ vọng command, keymaps, rendered buffer, repo/global scope và JSON cùng khớp. Đây là E2E tự động qua Neovim thật nhưng headless; không coi là bằng chứng layout nhìn thấy được.
+- [ ] Chạy E2E tương tác trong Neovim TUI qua PTY cô lập ở kích thước thường và hẹp: mở `:AgentBoard`, dùng phím thật tạo/đổi tên/di chuyển/xóa task, chuyển repo/global, mở rồi hide/reopen floating terminal bằng fixture agent. Kiểm tra screen render, focus, cuộn ngang, keymap không lọt vào agent, và JSON sau luồng; lưu screen capture/terminal transcript vào `docs/superpowers/verification/2026-10-07-agent-board/`.
 - [ ] Commit UI/README/tests: `feat: add repo and global Kanban board`.
 
 ### Task 6: Kiểm chứng runtime và hoàn tất MVP
@@ -141,6 +142,7 @@ Shared types: `Ref={repo:string,id:string}`; `Task` như spec; `ViewTask={repo:s
 
 - [ ] Chạy `nvim --headless -u NONE -l tests/check.lua`; kỳ vọng exit 0 trước live checks.
 - [ ] Chạy `nvim --headless -u NONE -l tests/ui_e2e.lua`; kỳ vọng plugin command và thao tác bàn phím CRUD/global hoàn tất trên hai repo tạm. Đây là UI E2E qua Neovim thực; layout trực quan được kiểm tra trong PTY ở Task 5.
+- [ ] Chạy lại E2E tương tác TUI trong PTY sạch theo Task 5; ghi capture cho board ở kích thước thường/hẹp và floating terminal sau open/hide/reopen, cùng kết quả CRUD/repo-global và JSON. Báo riêng lỗi tương tác/render với lỗi Herdr runtime.
 - [ ] Trong môi trường Herdr hợp lệ, tạo session test cô lập và hai Git repo tạm, không dùng agent/pane sẵn của người dùng. Nếu harness/skill chưa cho phép tạo môi trường test, ghi blocker và yêu cầu môi trường đó; không báo pass runtime.
 - [ ] Kiểm chứng thủ công bằng Neovim thật: CRUD/reload, repo/global switching, create từ global đúng đích, delete không stop, stale edit giữa hai Neovim trả conflict. Ghi command/setup và kết quả.
 - [ ] Với từng provider đã cài, start → Doing → attach → prompt vô hại → hide → reopen cùng identity → quit/reopen Neovim → attach lại. Kiểm tra bind phiên đã mở trước và duplicate-link rejection. Ghi provider vắng mặt là chưa kiểm chứng.
