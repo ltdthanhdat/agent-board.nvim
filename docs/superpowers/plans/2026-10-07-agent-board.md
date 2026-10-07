@@ -79,13 +79,13 @@ Shared types: `Ref={repo:string,id:string}`; `Task` như spec; `ViewTask={repo:s
 
 **Files:** Create `lua/agent-board/tasks.lua`, `lua/agent-board/init.lua`; extend `tests/check.lua`.
 
-**Interfaces:** Consumes Task 1. Produces `tasks.resolve_repo(cwd) -> root | nil,err`, `tasks.list_tasks(opts) -> ViewTask[],warnings | nil,err`, `tasks.get_task(ref)`, `tasks.create_task(opts)`, `tasks.update_task(ref,patch)`, `tasks.move_task(ref,status)`, `tasks.delete_task(ref)`, `tasks.register_repo(root)`. Init exports same public functions plus `setup(opts)`; CRUD returns saved task (delete returns true).
+**Interfaces:** Consumes Task 1. Produces `tasks.resolve_repo(cwd) -> root | nil,err`, `tasks.list_tasks(opts) -> ViewTask[],warnings,snapshots | nil,err`, `tasks.get_task(ref)`, `tasks.create_task(opts,expected_snapshot?)`, `tasks.update_task(ref,patch,expected_snapshot?)`, `tasks.move_task(ref,status,expected_snapshot?)`, `tasks.delete_task(ref,expected_snapshot?)`, `tasks.register_repo(root)`. Init exports public CRUD functions plus `setup(opts)`; list snapshots map canonical repo roots to storage snapshots; CRUD returns saved task (delete returns true).
 
 - [ ] Thêm assertions: tạo hai temp Git repo, một đường dẫn space/Unicode và một symlink; đăng ký symlink không tạo duplicate. Tạo/move/rename/reload giữ ID; title duplicate được phép, ID không trùng. Global chứa đúng hai repo; delete chỉ sửa board đích. Repo missing cảnh báo nhưng repo tốt vẫn đọc được; board hỏng không bị bỏ qua khi kiểm tra tính duy nhất liên kết. Patch agent/ID/status ngoài API riêng bị từ chối.
 - [ ] Chạy headless check; kỳ vọng FAIL ở contracts mới.
 - [ ] Implement Git toplevel bằng argv và `fs_realpath`; stable opaque IDs bằng native randomness nếu có, hoặc SHA-256 của high-resolution time/process/counter với kiểm tra collision trong document. Registry mutations và CRUD luôn lock registry rồi board, so snapshot, save, release. List/get reload từ disk; UI snapshot được truyền nội bộ cho mutation để stale view nhận conflict. Không cho public caller bypass validator.
 - [ ] Chạy check; kỳ vọng exit 0. Xác nhận temp Git repos chỉ nằm trong tmpdir.
-- [ ] Commit file Task 2 và tests: `feat: add repo and global task API`.
+- [ ] Commit files Task 2, tests, and this interface clarification: `feat: add repo and global task API`.
 
 ### Task 3: Herdr transport và định danh
 

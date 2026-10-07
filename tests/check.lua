@@ -2,6 +2,8 @@ package.path = './lua/?.lua;./lua/?/init.lua;' .. package.path
 
 local ok, storage = pcall(require, 'agent-board.storage')
 assert(ok, 'agent-board.storage is missing')
+local configured_registry_path = storage.registry_path()
+assert(configured_registry_path:match('agent%-board[/\\]repos%.json$'), 'registry path must be under agent-board')
 
 local function eq(actual, expected, message)
   assert(vim.deep_equal(actual, expected), message or ('values differ: ' .. vim.inspect(actual)))
@@ -54,6 +56,79 @@ local registry_path = root .. '/agent-board/repos.json'
 local empty_registry = storage.read(registry_path, 'registry')
 eq(empty_registry, { version = 1, revision = 0, repos = {} }, 'missing registry defaults')
 
+local tasks_ok, tasks = pcall(require, 'agent-board.tasks')
+assert(tasks_ok, 'agent-board.tasks is missing')
+storage.registry_path = function()
+  return root .. '/isolated-data/agent-board/repos.json'
+end
+
+local function git_init(path)
+  assert(vim.fn.mkdir(path, 'p') == 1)
+  local result = vim.system({ 'git', 'init', '-q', '--initial-branch=main', path }):wait()
+  assert(result.code == 0, result.stderr)
+  return assert(vim.uv.fs_realpath(path))
+end
+
+local repo_a = git_init(root .. '/repo space 日本語')
+local repo_b = git_init(root .. '/another-repo')
+assert(vim.fn.mkdir(repo_a .. '/nested/work', 'p') == 1)
+local resolved_repo, resolve_error = tasks.resolve_repo(repo_a .. '/nested/work')
+eq(resolved_repo, repo_a, resolve_error)
+
+local alias = root .. '/repo-alias'
+assert(vim.uv.fs_symlink(repo_a, alias))
+eq(tasks.register_repo(repo_a), repo_a, 'register first repo')
+eq(tasks.register_repo(alias), repo_a, 'symlink registration canonicalizes path')
+local isolated_registry = assert(storage.read(storage.registry_path(), 'registry'))
+eq(isolated_registry.repos, { repo_a }, 'duplicate repo registration is idempotent')
+
+local first = assert(tasks.create_task({ repo = repo_a, title = 'Same title' }))
+local second = assert(tasks.create_task({ repo = repo_a, title = 'Same title' }))
+assert(first.id ~= second.id, 'duplicate titles still have unique IDs')
+local original_id = first.id
+first = assert(tasks.update_task({ repo = repo_a, id = first.id }, { title = 'Renamed' }))
+eq(first.id, original_id, 'rename preserves task ID')
+assert(tasks.update_task({ repo = repo_a, id = first.id }, { status = 'doing' }) == nil, 'status cannot bypass move_task')
+assert(tasks.update_task({ repo = repo_a, id = first.id }, { agent = {} }) == nil, 'agent cannot bypass link API')
+first = assert(tasks.move_task({ repo = repo_a, id = first.id }, 'doing'))
+eq(tasks.get_task({ repo = repo_a, id = first.id }), first, 'task reload preserves move and rename')
+local third = assert(tasks.create_task({ repo = repo_b, title = 'Other repo' }))
+assert(third.id ~= first.id and third.id ~= second.id, 'task IDs do not collide across boards')
+
+local repo_tasks = assert(tasks.list_tasks({ scope = 'repo', repo = repo_a }))
+eq(#repo_tasks, 2, 'repo scope includes only its cards')
+local global_tasks, global_warnings, global_snapshots = tasks.list_tasks({ scope = 'global' })
+eq(#global_tasks, 3, 'global scope aggregates registered boards')
+eq(global_warnings, {}, 'healthy repos have no warnings')
+local global_repos = {}
+for _, row in ipairs(global_tasks) do
+  global_repos[row.repo] = true
+end
+assert(global_repos[repo_a] and global_repos[repo_b], 'global rows identify their source repos')
+
+local external, external_snapshot = storage.read(repo_a .. '/.agent-board.json', 'board')
+external.revision = external.revision + 1
+external.tasks[1].title = 'external change'
+local release_external = assert(storage.lock(repo_a .. '/.agent-board.json'))
+assert(storage.write_locked(repo_a .. '/.agent-board.json', external, external_snapshot))
+release_external()
+local stale_result, stale_error = tasks.move_task({ repo = repo_a, id = first.id }, 'done', global_snapshots[repo_a])
+assert(stale_result == nil and stale_error:find('reload', 1, true), 'stale UI snapshot must require reload')
+eq(tasks.get_task({ repo = repo_a, id = first.id }).title, 'external change', 'stale UI cannot overwrite external edits')
+
+local missing_repo = git_init(root .. '/removed-repo')
+assert(tasks.register_repo(missing_repo))
+assert(vim.fn.delete(missing_repo, 'rf') == 0)
+local surviving_tasks, missing_warnings = tasks.list_tasks({ scope = 'global' })
+eq(#surviving_tasks, 3, 'unavailable repo does not hide healthy boards')
+assert(#missing_warnings == 1 and missing_warnings[1].repo == missing_repo, 'unavailable repo is reported')
+
+local broken_repo = git_init(root .. '/broken-repo')
+assert(tasks.register_repo(broken_repo))
+write(broken_repo .. '/.agent-board.json', '{broken json')
+local hidden_broken, broken_error = tasks.list_tasks({ scope = 'global' })
+assert(hidden_broken == nil and broken_error, 'corrupt registered board must not be silently skipped')
+
 local invalid_documents = {
   { version = 1, revision = 1, tasks = { task('first'), task('duplicate') } },
   { version = 1, revision = 1, tasks = { { id = 'task-1', title = 'bad status', status = 'blocked', agent = vim.NIL } } },
@@ -104,9 +179,6 @@ eq(read_bytes(board_path), bytes_before, 'failed write must preserve current byt
 release_invalid()
 local release_after_error = assert(storage.lock(board_path))
 release_after_error()
-
-local registry = storage.registry_path()
-assert(registry:match('agent%-board[/\\]repos%.json$'), 'registry path must be under agent-board')
 
 vim.fn.delete(root, 'rf')
 print('agent-board checks passed')
