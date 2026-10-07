@@ -36,8 +36,11 @@ local function validate_agent(agent)
   if agent.runtime ~= 'herdr' then
     return false, 'agent runtime must be herdr'
   end
-  if not valid_string(agent.server) or not valid_string(agent.pane_id) or not valid_string(agent.name) then
-    return false, 'agent server, pane_id, and name must be non-empty strings'
+  if not valid_string(agent.server) or not valid_string(agent.terminal_id) or not valid_string(agent.pane_id) then
+    return false, 'agent server, terminal_id, and pane_id must be non-empty strings'
+  end
+  if agent.name ~= nil and agent.name ~= vim.NIL and not valid_string(agent.name) then
+    return false, 'agent name must be a non-empty string or null'
   end
   if agent.session_id ~= nil and agent.session_id ~= vim.NIL and type(agent.session_id) ~= 'string' then
     return false, 'agent session_id must be a string or null'

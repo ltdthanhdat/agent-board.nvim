@@ -99,10 +99,11 @@ Mỗi repo có `.agent-board.json`:
       "title": "Sửa lỗi đăng nhập",
       "status": "doing",
       "agent": {
-        "provider": "codex",
-        "runtime": "herdr",
-        "server": "server-identity",
-        "pane_id": "opaque-pane-id",
+      "provider": "codex",
+      "runtime": "herdr",
+      "server": "server-identity",
+      "terminal_id": "term_opaque_runtime_id",
+      "pane_id": "opaque-pane-id",
         "name": "agent-board-task-name",
         "session_id": null
       }
@@ -113,7 +114,7 @@ Mỗi repo có `.agent-board.json`:
 
 ID task ổn định, không đổi khi rename. Task chưa liên kết có `agent: null`. Thứ tự mảng xác định thứ tự card trong mỗi cột. Global dùng cặp `(repo_root, task_id)` để định vị task.
 
-`server`, `pane_id`, `name` biểu diễn liên kết Herdr; trường nhận diện chính xác phải được đối chiếu CLI thực tế trước implementation. Không giả định pane ID chính là conversation/session ID của provider. `session_id` chỉ có giá trị khi runtime thực sự cung cấp; không cần nó để attach vào phiên còn chạy. Khi runtime identity thay đổi, kiểm tra lại liên kết trước khi gửi input hoặc stop để tránh điều khiển nhầm agent.
+`server` là khóa định tuyến local Herdr (`HERDR_SOCKET_PATH`, nếu có; nếu không thì tên session Herdr/default), không phải server incarnation. `terminal_id` là identity của PTY Herdr và là bằng chứng occupant chính; `pane_id` định vị pane. `name` có thể thiếu với agent Herdr phát hiện nhưng chưa được đặt tên. `session_id` lưu `agent_session.value` khi có; không giả định `pane_id` là conversation ID của provider. Trước attach/send/stop phải xác nhận server route, pane và `terminal_id` còn khớp; nếu session ID đã lưu thì nó cũng phải khớp. Không gửi lệnh khi định danh đổi hoặc chưa xác minh.
 
 Registry tại `stdpath('data')/agent-board/repos.json`, chỉ chứa danh sách repo root. Không nhân bản task vào global store.
 

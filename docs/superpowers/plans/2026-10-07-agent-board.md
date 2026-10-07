@@ -34,12 +34,12 @@
 
 ## Trạng thái đầu vào và các quyết định triển khai
 
-- Workspace mới, chưa có Git; chỉ có spec/plan. Không có code cũ cần tương thích.
+- Workspace mới trên Git local `master`; không có code cũ cần tương thích.
 - Đã kiểm tra help của binary ngày 2026-10-07: Neovim 0.12.4, Herdr 0.7.5; không coi đây là bằng chứng runtime.
 - `agent start NAME --kind KIND --pane ID`, `agent attach TARGET`, `agent prompt TARGET TEXT` có trên CLI.
 - Không có `agent stop`; MVP dùng `pane close ID` sau kiểm tra identity. UI xác nhận rõ “dừng agent và đóng pane”, áp dụng cả phiên bind từ ngoài; không âm thầm dùng Ctrl-C vì Ctrl-C không bảo đảm thoát agent.
 - Phiên khảo sát không có `HERDR_ENV=1`; không inspect/control session Herdr của người dùng từ phiên này. Task 6 cần môi trường kiểm chứng cô lập hợp lệ.
-- Định danh server phải là incarnation của server, không chỉ socket path. Đọc schema/source Herdr ở Task 3 để chọn trường thật; nếu CLI không cung cấp chứng cứ phân biệt incarnation/occupant, đó là blocker cho thao tác điều khiển, không thay bằng phỏng đoán.
+- Herdr v0.7.5 `AgentInfo` có `terminal_id`, `pane_id`, `agent_status`, optional `name` và optional `agent_session.value`; status không có server-incarnation UUID. Khóa server là route local (`HERDR_SOCKET_PATH` hoặc `HERDR_SESSION`/`default`); occupant proof là `terminal_id`, cộng `agent_session.value` khi đã lưu. `name` có thể vắng ở agent phát hiện sẵn. Không derive terminal/session ID từ pane/name.
 - Status refresh: mỗi 2 giây khi board visible, một query async; không chồng query. Lỗi query hiển thị runtime unavailable, không đổi liên kết thành offline.
 - CRUD đồng bộ trả `value, err`; runtime async nhận callback cuối cùng `cb(value, err)`, được gọi đúng một lần trên main loop. `err = { code, message, agent? }`.
 - Snapshot là raw bytes, kể cả trạng thái missing; revision tăng sau mỗi write. So sánh bytes để phát hiện cả sửa ngoài plugin không tăng revision.
@@ -61,7 +61,7 @@
 | `README.md` | Install, mappings, runtime requirements, recovery/limits |
 | `THIRD_PARTY_NOTICES.md` | License/copyright phần terminal thích nghi |
 
-Shared types: `Ref={repo:string,id:string}`; `Task` như spec; `ViewTask={repo:string,task:Task}`; `Identity={provider,runtime='herdr',server,pane_id,name,session_id?}`; `LiveAgent={identity,cwd,state}`. `cb` runtime luôn nhận result hoặc structured error. Không ghi runtime state transient vào JSON.
+Shared types: `Ref={repo:string,id:string}`; `Task` như spec; `ViewTask={repo:string,task:Task}`; `Identity={provider,runtime='herdr',server,terminal_id,pane_id,name?,session_id?}`; `LiveAgent={identity,cwd,state}`. `cb` runtime luôn nhận result hoặc structured error. Không ghi runtime state transient vào JSON.
 
 ### Task 1: JSON store an toàn
 
@@ -89,16 +89,16 @@ Shared types: `Ref={repo:string,id:string}`; `Task` như spec; `ViewTask={repo:s
 
 ### Task 3: Herdr transport và định danh
 
-**Files:** Create `lua/agent-board/herdr.lua`; extend `tests/check.lua`.
+**Files:** Modify `lua/agent-board/storage.lua`; Create `lua/agent-board/herdr.lua`; extend `tests/check.lua`.
 
-**Interfaces:** Produces `herdr.list(cb)`, `herdr.resolve(identity,cb)`, `herdr.start(repo,provider,name,cb)`, `herdr.send(identity,message,cb)`, `herdr.stop(identity,cb)`, `herdr.attach_argv(identity) -> string[]`. Transport seam `herdr.run(argv,timeout_ms,cb)` dùng `vim.system`; fake thay hàm này trong check. Start trả Identity và owned host IDs; resolve trả LiveAgent hoặc `offline`/`identity_mismatch`/`runtime_unavailable`.
+**Interfaces:** Produces `Identity={provider,runtime='herdr',server,terminal_id,pane_id,name?,session_id?}` and `LiveAgent={identity,cwd,state}`; `herdr.list(cb)`, `herdr.resolve(identity,cb)`, `herdr.start(repo,provider,name,cb)`, `herdr.send(identity,message,cb)`, `herdr.stop(identity,cb)`, `herdr.attach_argv(identity) -> string[]`. Transport seam `herdr.run(argv,timeout_ms,cb)` uses `vim.system`; fake thay hàm này trong check. Start returns Identity and owned host IDs; resolve returns LiveAgent or `offline`/`identity_mismatch`/`runtime_unavailable`.
 
-- [ ] Đọc help/schema hoặc source canonical Herdr 0.7.5, ghi response fixtures nhỏ từ schema xác nhận và chọn trường server/occupant identity có thật. Không query session người dùng từ ngoài Herdr. Nếu identity proof thiếu, dừng task và báo blocker cụ thể trước khi implement điều khiển.
-- [ ] Thêm fake transport assertions: malformed/null JSON và nonzero/timeout là lỗi; list rỗng thành công là offline cho missing agent. Server incarnation hoặc occupant đổi bị chặn trước attach/send/close. Name/provider/cwd đúng argv dù chứa shell metacharacters; callback đúng một lần.
+- [x] Đọc source canonical Herdr v0.7.5 tại commit `ef4c23f5775bb8cfec05f05d0844226ff959a07a`: `AgentInfo`/`PaneInfo` có `terminal_id`, `pane_id`, `agent_status`; `AgentInfo.name` và `agent_session` là optional. CLI status không phát server-incarnation UUID.
+- [ ] Thêm fake transport assertions theo JSON envelope thật: list/get/start, unnamed existing agent, malformed/null JSON, agent-not-found/offline, nonzero/timeout/runtime-unavailable. Server route, `terminal_id`, hoặc stored `agent_session.value` đổi thì attach/send/close bị chặn. `terminal_id` bắt buộc khi lưu; argv giữ nguyên repo/name/message có space và shell metacharacters; callback đúng một lần.
 - [ ] Chạy check; kỳ vọng FAIL ở adapter.
-- [ ] Implement async contracts, `vim.schedule` callbacks và timeout hữu hạn. Dedicated workspace label `agent-board.nvim`; create tab `--cwd repo --no-focus`, lấy IDs từ JSON rồi start unique name hợp lệ Herdr. Không prune workspace hoặc đóng tài nguyên có sẵn. Nếu start timeout, xác minh occupant trước khi dọn host; nếu không chắc, trả host identity để recovery.
+- [ ] Implement async contracts, `vim.schedule` callbacks và timeout hữu hạn. Dedicated workspace label `agent-board.nvim`; create tab `--cwd repo --no-focus`, lấy IDs từ JSON rồi start unique name hợp lệ Herdr. Không prune workspace hoặc đóng tài nguyên có sẵn. Identity lưu route local, terminal ID từ AgentInfo và optional `agent_session.value`; bind cho phép name null. Nếu start timeout, xác minh occupant trước khi dọn host; nếu không chắc, trả host identity để recovery.
 - [ ] Implement send bằng `agent prompt` không `--wait`; stop kiểm tra identity rồi `pane close`. Queries tối đa 5 giây, start CLI tối đa 35 giây với Herdr readiness timeout 30 giây. Không mặc định server absence thành agent absence.
-- [ ] Chạy check; kỳ vọng exit 0; ghi CLI contract đã chọn vào README draft.
+- [ ] Chạy check; kỳ vọng exit 0; ghi CLI contract vào ledger để README ở Task 5 nêu Herdr 0.7.5 yêu cầu.
 - [ ] Commit adapter/tests: `feat: add async Herdr runtime adapter`.
 
 ### Task 4: Liên kết session và floating terminal
