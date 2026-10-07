@@ -145,6 +145,21 @@ input_responses[#input_responses + 1] = 'Renamed task 🔐'
 press('r')
 eq(task_from(repo_a, first_id).title, 'Renamed task 🔐')
 
+local regular_input, held_input_callback = vim.ui.input, nil
+vim.ui.input = function(_, callback) held_input_callback = callback end
+press('r')
+assert(held_input_callback, 'rename prompt stays open for the stale snapshot case')
+assert(tasks.update_task({ repo = repo_a, id = first_id }, { title = 'External rename' }))
+board.refresh()
+vim.wait(20)
+local regular_notify, stale_notice = vim.notify, nil
+vim.notify = function(message) stale_notice = message end
+held_input_callback('Stale UI rename')
+vim.notify = regular_notify
+vim.ui.input = regular_input
+eq(task_from(repo_a, first_id).title, 'External rename', 'a poll while rename prompt is open cannot bypass the snapshot conflict')
+contains(stale_notice, 'board changed; reload before saving')
+
 select_responses[#select_responses + 1] = choose('doing')
 press('m')
 eq(task_from(repo_a, first_id).status, 'doing')

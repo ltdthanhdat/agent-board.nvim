@@ -503,13 +503,9 @@ function M.bind_agent(ref, identity, expected_snapshot, callback)
   local done = callback_once(callback)
   local tx, tx_error = begin_transaction(ref, expected_snapshot)
   if not tx then return done(nil, tx_error) end
-  if linked(tx.task.agent) then
-    tx.release()
-    return done(nil, runtime_failure('already_linked', 'task already has a linked agent'))
-  end
-
   local herdr = require('agent-board.herdr')
-  local on_resolved = guarded(tx, done, function(live, resolve_error)
+
+  local on_candidate = guarded(tx, done, function(live, resolve_error)
     if not live then
       tx.release()
       return done(nil, resolve_error or runtime_failure('runtime_unavailable', 'could not verify Herdr agent'))
@@ -527,7 +523,28 @@ function M.bind_agent(ref, identity, expected_snapshot, callback)
     end
     done(vim.deepcopy(tx.task))
   end)
-  local ok, resolve_call_error = pcall(herdr.resolve, identity, on_resolved)
+
+  local function resolve_candidate()
+    local ok, resolve_call_error = pcall(herdr.resolve, identity, on_candidate)
+    if not ok then
+      tx.release()
+      done(nil, runtime_failure('runtime_error', tostring(resolve_call_error)))
+    end
+  end
+
+  if not linked(tx.task.agent) then return resolve_candidate() end
+  local on_existing = guarded(tx, done, function(existing, existing_error)
+    if existing then
+      tx.release()
+      return done(nil, runtime_failure('already_linked', 'task already has a live linked agent'))
+    end
+    if not existing_error or existing_error.code ~= 'offline' then
+      tx.release()
+      return done(nil, existing_error or runtime_failure('runtime_unavailable', 'could not verify the existing Herdr agent'))
+    end
+    resolve_candidate()
+  end)
+  local ok, resolve_call_error = pcall(herdr.resolve, runtime_identity(tx.task.agent), on_existing)
   if not ok then
     tx.release()
     done(nil, runtime_failure('runtime_error', tostring(resolve_call_error)))

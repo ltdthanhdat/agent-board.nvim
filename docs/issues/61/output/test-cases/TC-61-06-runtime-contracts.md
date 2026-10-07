@@ -12,7 +12,7 @@
 ## Steps
 
 1. Chạy command từ repo root; kiểm tra exit code 0 và output `agent-board checks passed`.
-2. Xác nhận failed start giữ Todo và link rỗng; save failure sau start trả identity để phục hồi, không stop agent.
+2. Xác nhận failed start giữ Todo và link rỗng; identity thiếu provider session ID fail closed và trả thông tin pane/agent đã khởi động. Save failure sau start trả identity để phục hồi, không stop agent. Bind chỉ thay link cũ khi Herdr xác nhận link đó offline; recovery bind giữ link cũ khi còn live.
 3. Xác nhận offline, timeout và server error được phân biệt; runtime error không được diễn giải là agent offline.
 4. Xác nhận agent đã link ở repo khác hoặc đã được bind đồng thời không thể link lần hai.
 5. Xác nhận board đăng ký hỏng/mất ngăn bind fail-open và attempted bind giữ nguyên bytes JSON lỗi trong headless checks. Chạy runner hai process: cả hai đọc cùng revision, writer B cập nhật trước, writer A nhận yêu cầu reload; JSON cuối vẫn giữ title mới và Todo.
@@ -20,7 +20,7 @@
 
 ## Actual
 
-Hai commands exit 0. Headless output `agent-board checks passed`; assertions gồm failed start, save failure recovery identity, corrupt board bytes giữ nguyên, stale snapshot, duplicate/concurrent link và lifecycle không stop agent khi rename/Done/delete. Runner hai process ghi `Neovim A rejected stale snapshot with reload-required error`, `Neovim B saved a newer task revision`, và xác nhận JSON cuối giữ title `Fresh update from Neovim B` cùng status `todo`.
+Hai commands exit 0. Headless output `agent-board checks passed`; assertions gồm failed start, identity sessionless fail closed, save failure recovery identity và bind, không thay link đang live, corrupt board bytes giữ nguyên, stale snapshot, duplicate/concurrent link và lifecycle không stop agent khi rename/Done/delete. Runner hai process ghi `Neovim A rejected stale snapshot with reload-required error`, `Neovim B saved a newer task revision`, và xác nhận JSON cuối giữ title `Fresh update from Neovim B` cùng status `todo`.
 
 ## Evidence
 

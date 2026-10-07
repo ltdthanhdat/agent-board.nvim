@@ -246,6 +246,21 @@ responses[#responses + 1] = result({ type = 'agent_info', agent = agent_info({ a
 local changed_session, changed_session_error = await(function(cb) herdr.resolve(identity, cb) end)
 assert(changed_session == nil and changed_session_error.code == 'identity_mismatch', 'changed provider session is rejected')
 
+local sessionless_identity = {
+  provider = 'codex', runtime = 'herdr', server = expected_server,
+  terminal_id = 'term_1234', pane_id = 'w1:p1',
+}
+local sessionless_requests = #requests
+responses[#responses + 1] = result({ type = 'agent_info', agent = agent_info({
+  terminal_id = 'term_1234', pane_id = 'w1:p1', name = vim.NIL, agent_session = vim.NIL,
+}) })
+local sessionless, sessionless_error = await(function(cb) herdr.resolve(sessionless_identity, cb) end)
+assert(sessionless == nil and sessionless_error.code == 'identity_unverifiable', 'sessionless identity cannot verify an agent occupant')
+eq(#requests, sessionless_requests, 'sessionless identity is rejected before querying Herdr')
+local sessionless_argv, sessionless_attach_error = herdr.attach_argv(sessionless_identity)
+assert(sessionless_argv == nil and sessionless_attach_error.code == 'identity_unverifiable', 'sessionless identity cannot attach')
+table.remove(responses, #responses)
+
 responses[#responses + 1] = result({ type = 'agent_info', agent = agent_info() })
 local resolved, resolve_error = await(function(cb) herdr.resolve(identity, cb) end)
 assert(not resolve_error)
@@ -291,6 +306,18 @@ eq(requests[#requests - 3], { 'workspace', 'list' }, 'start checks the dedicated
 eq(requests[#requests - 2], { 'workspace', 'create', '--no-focus', '--label', 'agent-board.nvim' }, 'start creates only its workspace')
 eq(requests[#requests - 1], { 'tab', 'create', '--cwd', start_repo, '--no-focus', '--workspace', 'w-agent', '--label', 'ab-task' }, 'start preserves repo path in argv')
 eq(requests[#requests], { 'agent', 'start', 'ab-task', '--kind', 'codex', '--pane', 'w-agent:p1', '--timeout', '30000' }, 'start uses returned pane ID')
+
+local no_session_start_info = agent_info({
+  terminal_id = 'term_no_session', name = 'ab-no-session', workspace_id = 'w-agent',
+  tab_id = 'w-agent:t-no-session', pane_id = 'w-agent:p-no-session', agent_session = vim.NIL,
+})
+responses[#responses + 1] = result({ type = 'workspace_list', workspaces = { { workspace_id = 'w-agent', label = 'agent-board.nvim' } } })
+responses[#responses + 1] = result({ type = 'tab_created', tab = { tab_id = 'w-agent:t-no-session' }, root_pane = { pane_id = 'w-agent:p-no-session' } })
+responses[#responses + 1] = result({ type = 'agent_started', agent = no_session_start_info, argv = { 'codex' } })
+local no_session_start, no_session_start_error = await(function(cb) herdr.start(start_repo, 'codex', 'ab-no-session', cb) end)
+assert(no_session_start == nil and no_session_start_error.code == 'identity_unverifiable', 'start cannot persist an agent without provider session identity')
+eq(no_session_start_error.agent.terminal_id, 'term_no_session', 'sessionless start failure returns the started agent identity')
+eq(no_session_start_error.host.pane_id, 'w-agent:p-no-session', 'sessionless start failure returns the created host')
 
 local second_start_info = agent_info({ terminal_id = 'term_second', name = 'ab-second', workspace_id = 'w-agent', tab_id = 'w-agent:t2', pane_id = 'w-agent:p2' })
 responses[#responses + 1] = result({ type = 'workspace_list', workspaces = { { workspace_id = 'w-agent', label = 'agent-board.nvim' } } })
@@ -432,6 +459,14 @@ assert(bound and not bind_error, 'binding a live agent should succeed')
 eq(bound.status, 'todo', 'binding does not move the task')
 eq(bound.agent.terminal_id, bind_identity.terminal_id, 'binding persists verified identity')
 
+local live_replacement_identity = identity_for('term-live-replacement', 'task4:live-replacement', 'replacement-agent', 'session-replacement')
+live_agents[live_replacement_identity.pane_id] = live_for(live_replacement_identity)
+local live_rebind, live_rebind_error = await(function(callback)
+  api.bind_agent({ repo = task4_repo_a, id = bind_task.id }, live_replacement_identity, callback)
+end)
+assert(live_rebind == nil and live_rebind_error.code == 'already_linked', 'a live link cannot be replaced through bind')
+eq(tasks.get_task({ repo = task4_repo_a, id = bind_task.id }).agent.terminal_id, bind_identity.terminal_id, 'rejected live rebind preserves its link')
+
 local duplicate, duplicate_error = await(function(callback)
   api.bind_agent({ repo = task4_repo_b, id = duplicate_task.id }, bind_identity, callback)
 end)
@@ -470,6 +505,13 @@ eq(starts, existing_start_count, 'an already-live link does not spawn another ag
 eq(opened_existing, 1, 'an already-live link opens its existing terminal')
 terminal.open = original_terminal_open
 
+local offline_identity = identity_for('term-offline-save-failure', 'task4:offline-save-failure', 'old-agent', 'session-old')
+live_agents[offline_identity.pane_id] = live_for(offline_identity)
+assert(await(function(callback)
+  api.bind_agent({ repo = task4_repo_a, id = save_failed_task.id }, offline_identity, callback)
+end))
+live_agents[offline_identity.pane_id] = nil
+
 local saved_write_locked = storage.write_locked
 storage.write_locked = function(path, document, snapshot)
   if path == task4_repo_a .. '/.agent-board.json' then
@@ -485,6 +527,12 @@ storage.write_locked = saved_write_locked
 assert(save_failed == nil and save_error and save_error.agent and save_error.agent.terminal_id, 'save failure returns the started agent identity')
 eq(stops, stops_before_save_failure, 'save failure never stops a started agent')
 eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).status, 'todo', 'save failure does not claim Doing was persisted')
+eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).agent.terminal_id, offline_identity.terminal_id, 'save failure preserves the previously persisted offline link')
+local recovered, recovery_error = await(function(callback)
+  api.bind_agent({ repo = task4_repo_a, id = save_failed_task.id }, save_error.agent, callback)
+end)
+assert(recovered and not recovery_error, 'a verified running replacement can recover a failed replacement save')
+eq(recovered.agent.terminal_id, save_error.agent.terminal_id, 'recovery links the new running agent')
 
 local stop_identity = identity_for('term-stop', 'task4:stop', 'stop-agent', 'session-stop')
 live_agents[stop_identity.pane_id] = live_for(stop_identity)

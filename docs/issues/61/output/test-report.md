@@ -29,8 +29,8 @@
 | Create, rename, move, Done, cancel/delete giữ dữ liệu đúng; delete không stop agent | [TC-61-02](test-cases/TC-61-02-task-crud.md) | PASS, fixture local | PTY text captures, JSON snapshots |
 | Repo/global switching; tạo từ global vào đúng repo; task ID trùng giữa hai repo không nhầm đích | [TC-61-03](test-cases/TC-61-03-repo-global.md) | PASS, fixture local | PTY text captures, registry/JSON |
 | Attach float, hide/reopen giữ cùng attach client; input và prompt đi qua fake CLI | [TC-61-04](test-cases/TC-61-04-herdr-float.md) | PASS, fixture local | PTY text captures, attach/input/prompt logs |
-| `:AgentBoard` và mappings qua Neovim headless; persistence, bind/start/stop/send, lỗi runtime và callback safety | [TC-61-05](test-cases/TC-61-05-headless-ui-e2e.md) | PASS | `headless-ui-e2e.txt` |
-| Runtime/lifecycle contracts: failed start, save failure sau start, offline, duplicate/concurrent link, corrupt board, stale write giữa hai Neovim | [TC-61-06](test-cases/TC-61-06-runtime-contracts.md) | PASS trong headless/fake fixture | `runtime-contracts.txt`, [reproducible two-Neovim runner and output](evidence/two-neovim-stale-check.sh) |
+| `:AgentBoard` và mappings qua Neovim headless; persistence, bind/start/stop/send, lỗi runtime, callback safety và stale prompt conflict sau poll | [TC-61-05](test-cases/TC-61-05-headless-ui-e2e.md) | PASS | `headless-ui-e2e.txt` |
+| Runtime/lifecycle contracts: failed start, fail closed khi thiếu session identity, recovery sau save failure, bảo vệ live link, offline, duplicate/concurrent link, corrupt board, stale write giữa hai Neovim | [TC-61-06](test-cases/TC-61-06-runtime-contracts.md) | PASS trong headless/fake fixture | `runtime-contracts.txt`, [reproducible two-Neovim runner and output](evidence/two-neovim-stale-check.sh) |
 
 ## Kết luận
 

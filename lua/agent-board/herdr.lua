@@ -153,9 +153,16 @@ local function valid_identity(identity)
     and type(identity.pane_id) == 'string'
 end
 
+local function has_session_identity(identity)
+  return type(identity.session_id) == 'string' and identity.session_id ~= ''
+end
+
 function M.resolve(identity, callback)
   if not valid_identity(identity) then
     return callback(nil, failure('identity_mismatch', 'Herdr identity is incomplete'))
+  end
+  if not has_session_identity(identity) then
+    return callback(nil, failure('identity_unverifiable', 'Herdr did not provide a provider session ID'))
   end
   if identity.server ~= M.server_key() then
     return callback(nil, failure('identity_mismatch', 'The active Herdr route has changed'))
@@ -185,6 +192,9 @@ end
 function M.attach_argv(identity)
   if not valid_identity(identity) or identity.server ~= M.server_key() then
     return nil, failure('identity_mismatch', 'The active Herdr route does not match this agent')
+  end
+  if not has_session_identity(identity) then
+    return nil, failure('identity_unverifiable', 'Herdr did not provide a provider session ID')
   end
   return { 'herdr', 'agent', 'attach', identity.pane_id }
 end
@@ -232,8 +242,8 @@ function M.start(repo, provider, name, callback)
     return callback(nil, failure('invalid_input', 'repo, provider, or Herdr agent name is invalid'))
   end
   local server = M.server_key()
-  local function finish_host_error(err, host)
-    return callback(nil, failure(err.code, err.message, { host = host }))
+  local function finish_host_error(err, host, agent)
+    return callback(nil, failure(err.code, err.message, { host = host, agent = agent }))
   end
 
   request({ 'workspace', 'list' }, QUERY_TIMEOUT_MS, function(result, err)
@@ -275,6 +285,9 @@ function M.start(repo, provider, name, callback)
           local live, normalize_error = normalize(start_result.agent, server)
           if normalize_error or not live then
             return finish_host_error(normalize_error or failure('runtime_unavailable', 'Herdr start response has no agent'), host)
+          end
+          if not has_session_identity(live.identity) then
+            return finish_host_error(failure('identity_unverifiable', 'Herdr did not provide a provider session ID'), host, live.identity)
           end
           if live.identity.name ~= name or live.identity.provider ~= provider or live.identity.pane_id ~= pane.pane_id then
             return finish_host_error(failure('identity_mismatch', 'Herdr started an unexpected agent or pane'), host)

@@ -31,6 +31,7 @@
 3. Agent chạy được nhưng save thất bại: trả identity để phục hồi, không stop agent hay báo đã lưu (Task 4).
 4. Pane bị thay agent hoặc server restart: không attach/send/stop nhầm occupant (Task 3/4).
 5. Window đóng trong lúc query đang chạy: callback không ghi vào buffer chết, poller được dừng (Task 5).
+6. Prompt/picker còn mở qua một lần poll: callback giữ snapshot lúc thao tác bắt đầu để không ghi đè writer mới (Task 5/6).
 
 ## Trạng thái đầu vào và các quyết định triển khai
 
@@ -39,7 +40,7 @@
 - `agent start NAME --kind KIND --pane ID`, `agent attach TARGET`, `agent prompt TARGET TEXT` có trên CLI.
 - Không có `agent stop`; MVP dùng `pane close ID` sau kiểm tra identity. UI xác nhận rõ “dừng agent và đóng pane”, áp dụng cả phiên bind từ ngoài; không âm thầm dùng Ctrl-C vì Ctrl-C không bảo đảm thoát agent.
 - Phiên khảo sát không có `HERDR_ENV=1`; không inspect/control session Herdr của người dùng từ phiên này. Task 6 cần môi trường kiểm chứng cô lập hợp lệ.
-- Herdr v0.7.5 `AgentInfo` có `terminal_id`, `pane_id`, `agent_status`, optional `name` và optional `agent_session.value`; status không có server-incarnation UUID. Khóa server là route local (`HERDR_SOCKET_PATH` hoặc `HERDR_SESSION`/`default`); occupant proof là `terminal_id`, cộng `agent_session.value` khi đã lưu. `name` có thể vắng ở agent phát hiện sẵn. Không derive terminal/session ID từ pane/name.
+- Herdr v0.7.5 `AgentInfo` có `terminal_id`, `pane_id`, `agent_status`, optional `name` và optional `agent_session.value`; status không có server-incarnation UUID. Khóa server là route local (`HERDR_SOCKET_PATH` hoặc `HERDR_SESSION`/`default`); chỉ lưu/điều khiển occupant khi có `agent_session.value` để phân biệt phiên thay thế trong cùng terminal. `name` có thể vắng ở agent phát hiện sẵn. Không derive terminal/session ID từ pane/name.
 - Status refresh: mỗi 2 giây khi board visible, một query async; không chồng query. Lỗi query hiển thị runtime unavailable, không đổi liên kết thành offline.
 - CRUD đồng bộ trả `value, err`; runtime async nhận callback cuối cùng `cb(value, err)`, được gọi đúng một lần trên main loop. `err = { code, message, agent? }`.
 - Snapshot là raw bytes, kể cả trạng thái missing; revision tăng sau mỗi write. So sánh bytes để phát hiện cả sửa ngoài plugin không tăng revision.
@@ -144,6 +145,7 @@ Shared types: `Ref={repo:string,id:string}`; `Task` như spec; `ViewTask={repo:s
 - [x] Chạy `nvim --headless -u NONE -l tests/ui_e2e.lua`; kỳ vọng plugin command và thao tác bàn phím CRUD/global hoàn tất trên hai repo tạm. Đây là UI E2E qua Neovim thực; layout trực quan được kiểm tra trong PTY ở Task 5.
 - [x] Chạy lại E2E tương tác TUI trong PTY sạch theo Task 5; ghi capture cho board ở kích thước thường/hẹp và floating terminal sau open/hide/reopen, cùng kết quả CRUD/repo-global và JSON. Báo riêng lỗi tương tác/render với lỗi Herdr runtime.
 - [x] Kiểm chứng stale write bằng runner tái lập qua hai process headless độc lập; runner assert conflict và JSON cuối. Lệnh và capture ở `docs/issues/61/output/evidence/two-neovim-stale-check.{sh,txt}`.
+- [x] Rà soát cuối: identity Herdr không có provider session ID phải fail closed; bind chỉ thay link đã xác nhận offline; prompt cũ sau poll phải báo conflict và giữ writer mới.
 - [x] Rà diff với spec: không thêm dependency hoặc phạm vi ngoài MVP; báo riêng UI fixture evidence và runtime thật chưa chạy.
 - [x] Ghi report, test case và giới hạn runtime; không push/publish.
 

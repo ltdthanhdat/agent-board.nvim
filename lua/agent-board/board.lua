@@ -280,62 +280,72 @@ local function refresh_after(state, value, err)
   if value and current(state) then M.refresh() end
 end
 
-local function create_task(state, repo)
+local function create_task(state, repo, expected_snapshot)
   prompt_title(function(title)
     if not title or title:match('^%s*$') then return end
-    local created, err = api.create_task({ repo = repo, title = title }, state.snapshots[repo])
+    local created, err = api.create_task({ repo = repo, title = title }, expected_snapshot)
     if not created then return notify(show_error(err)) end
     state.selected = ref_key(repo, created.id)
     M.refresh()
   end)
 end
 
-local function choose_repo(state, callback)
-  local repos = vim.tbl_keys(state.snapshots or {})
+local function choose_repo(state, callback, snapshots)
+  snapshots = snapshots or state.snapshots or {}
+  local repos = vim.tbl_keys(snapshots)
   table.sort(repos)
   choose(repos, 'Choose repository:', callback)
 end
 
 local function action_create(state)
-  if state.scope == 'repo' then return create_task(state, state.repo) end
+  local snapshots = state.snapshots or {}
+  if state.scope == 'repo' then return create_task(state, state.repo, snapshots[state.repo]) end
   choose_repo(state, function(repo)
-    if repo then create_task(state, repo) end
-  end)
+    if repo then create_task(state, repo, snapshots[repo]) end
+  end, snapshots)
 end
 
 local function action_rename(state)
   local ref, item = selected_ref(state)
   if not item then return end
+  local expected_snapshot = state.snapshots[ref.repo]
   prompt_title(function(title)
     if not title or title:match('^%s*$') then return end
-    local updated, err = api.update_task(ref, { title = title }, state.snapshots[ref.repo])
+    local updated, err = api.update_task(ref, { title = title }, expected_snapshot)
     if not updated then return notify(show_error(err)) end
     state.selected = ref_key(ref.repo, ref.id)
     M.refresh()
   end, item.task.title)
 end
 
-local function action_move(state, status)
-  local ref = selected_ref(state)
+local function action_move(state, status, ref, expected_snapshot)
+  if not ref then
+    ref = selected_ref(state)
+    if ref then expected_snapshot = state.snapshots[ref.repo] end
+  end
   if not ref then return end
-  local moved, err = api.move_task(ref, status, state.snapshots[ref.repo])
+  local moved, err = api.move_task(ref, status, expected_snapshot)
   if not moved then return notify(show_error(err)) end
   state.selected = ref_key(ref.repo, ref.id)
   M.refresh()
 end
 
 local function action_choose_status(state)
+  local ref = selected_ref(state)
+  if not ref then return end
+  local expected_snapshot = state.snapshots[ref.repo]
   choose(statuses, 'Move task to:', function(status)
-    if status then action_move(state, status) end
+    if status then action_move(state, status, ref, expected_snapshot) end
   end, function(status) return status_labels[status] end)
 end
 
 local function action_start(state)
   local ref = selected_ref(state)
   if not ref then return end
+  local expected_snapshot = state.snapshots[ref.repo]
   choose({ 'claude', 'codex', 'pi' }, 'Start agent with:', function(provider)
     if not provider then return end
-    api.start_agent(ref, { provider = provider, expected_snapshot = state.snapshots[ref.repo] }, function(value, err)
+    api.start_agent(ref, { provider = provider, expected_snapshot = expected_snapshot }, function(value, err)
       refresh_after(state, value, err)
     end)
   end)
@@ -344,11 +354,12 @@ end
 local function action_bind(state)
   local ref = selected_ref(state)
   if not ref then return end
+  local expected_snapshot = state.snapshots[ref.repo]
   herdr.list(function(agents, err)
     if err then return notify(show_error(err)) end
     choose(agents, 'Link running agent:', function(agent)
       if not agent then return end
-      api.bind_agent(ref, agent.identity, state.snapshots[ref.repo], function(value, bind_error)
+      api.bind_agent(ref, agent.identity, expected_snapshot, function(value, bind_error)
         refresh_after(state, value, bind_error)
       end)
     end, function(agent)
@@ -387,8 +398,9 @@ end
 local function action_delete(state)
   local ref, item = selected_ref(state)
   if not item then return end
+  local expected_snapshot = state.snapshots[ref.repo]
   confirm(state, 'Delete task and its link?', 'Delete', function()
-    local deleted, err = api.delete_task(ref, state.snapshots[ref.repo])
+    local deleted, err = api.delete_task(ref, expected_snapshot)
     if not deleted then return notify(show_error(err)) end
     state.selected = nil
     M.refresh()
