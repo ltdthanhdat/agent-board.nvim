@@ -186,7 +186,7 @@ function M.attach_argv(identity)
   if not valid_identity(identity) or identity.server ~= M.server_key() then
     return nil, failure('identity_mismatch', 'The active Herdr route does not match this agent')
   end
-  return { 'herdr', 'agent', 'attach', identity.pane_id }
+  return { 'herdr', 'terminal', 'attach', identity.terminal_id }
 end
 
 local function controlled_request(identity, args, callback)
@@ -227,7 +227,14 @@ local function start_name(name)
   return type(name) == 'string' and #name <= 32 and name:match('^[a-z][a-z0-9_-]*$') ~= nil
 end
 
-function M.start(repo, provider, name, callback)
+function M.start(repo, provider, name, callback, opts)
+  opts = opts or {}
+  if opts.agent_args and (type(opts.agent_args) ~= 'table' or not vim.islist(opts.agent_args)) then
+    return callback(nil, failure('invalid_input', 'agent_args must be an argv list'))
+  end
+  for _, arg in ipairs(opts.agent_args or {}) do
+    if type(arg) ~= 'string' then return callback(nil, failure('invalid_input', 'agent arguments must be strings')) end
+  end
   if type(repo) ~= 'string' or repo == '' or not providers[provider] or not start_name(name) then
     return callback(nil, failure('invalid_input', 'repo, provider, or Herdr agent name is invalid'))
   end
@@ -268,7 +275,9 @@ function M.start(repo, provider, name, callback)
         if server ~= M.server_key() then
           return finish_host_error(failure('identity_mismatch', 'The active Herdr route changed during start'), host)
         end
-        request({ 'agent', 'start', name, '--kind', provider, '--pane', pane.pane_id, '--timeout', tostring(START_TIMEOUT_MS) }, START_COMMAND_TIMEOUT_MS, function(start_result, start_error)
+        local argv = { 'agent', 'start', name, '--kind', provider, '--pane', pane.pane_id, '--timeout', tostring(START_TIMEOUT_MS) }
+        if opts.agent_args and #opts.agent_args > 0 then argv[#argv+1] = '--'; vim.list_extend(argv, opts.agent_args) end
+        request(argv, START_COMMAND_TIMEOUT_MS, function(start_result, start_error)
           if not start_result then
             return finish_host_error(start_error, host)
           end
@@ -278,6 +287,13 @@ function M.start(repo, provider, name, callback)
           end
           if live.identity.name ~= name or live.identity.provider ~= provider or live.identity.pane_id ~= pane.pane_id then
             return finish_host_error(failure('identity_mismatch', 'Herdr started an unexpected agent or pane'), host)
+          end
+          if server ~= M.server_key() then
+            return callback(nil, failure('identity_mismatch', 'The active Herdr route changed during start', {host=host,agent=live.identity}))
+          end
+          if opts.expected_session_id and live.identity.session_id ~= opts.expected_session_id then
+            local code = live.identity.session_id and 'identity_mismatch' or 'session_identity_unverified'
+            return callback(nil, failure(code, 'Herdr could not verify the requested Claude session UUID', {host=host,agent=live.identity}))
           end
           callback({ identity = live.identity, host = host })
         end)

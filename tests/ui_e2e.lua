@@ -11,6 +11,8 @@ local function git_init(path)
   return assert(vim.uv.fs_realpath(path))
 end
 
+vim.env.CLAUDE_CONFIG_DIR = root .. '/claude'
+
 local repo_a = git_init(root .. '/one/same-name')
 local repo_b = git_init(root .. '/two/same-name')
 local storage = require('agent-board.storage')
@@ -83,7 +85,7 @@ local function choose(value)
   return function(items)
     for _, item in ipairs(items) do
       if item == value then return item end
-      if type(item) == 'table' and (item.repo == value or item.root == value or item.identity and item.identity.pane_id == value) then
+      if type(item) == 'table' and (item.repo == value or item.root == value or item.identity and item.identity.pane_id == value or item.agent and item.agent.identity.pane_id == value) then
         return item
       end
     end
@@ -163,6 +165,10 @@ assert(started_task.agent ~= vim.NIL and starts == 1)
 
 press('<CR>')
 assert(terminal.is_open(table.concat({ repo_a, agent_task_id, 'herdr' }, '\0')))
+local float_win=vim.api.nvim_get_current_win()
+local float_config=vim.api.nvim_win_get_config(float_win)
+assert(float_config.relative=='editor' and float_config.title and float_config.footer,'float label and hide hint')
+assert(vim.api.nvim_win_get_buf(vim.api.nvim_tabpage_list_wins(0)[1])==board_buf,'board below float')
 press('<Esc>')
 press('q')
 assert(not terminal.is_open(table.concat({ repo_a, agent_task_id, 'herdr' }, '\0')), 'q hides the floating terminal')
@@ -170,6 +176,16 @@ press('<CR>')
 eq(spawn_count, 1, 'reopen reuses the attach client')
 press('<Esc>')
 press('q')
+press('<CR>')
+local conflict_buf=vim.api.nvim_get_current_buf()
+vim.api.nvim_buf_set_lines(conflict_buf,0,-1,false,{'{"type":"terminal.closed","reason":"terminal attach failed: terminal term-existing already has an attached client; retry with --takeover"}'})
+local conflict_notifications={}
+local original_notify=vim.notify
+vim.notify=function(message)conflict_notifications[#conflict_notifications+1]=tostring(message)end
+exits[1](1,0,'exit')
+assert(vim.wait(1000,function()return not terminal.is_open(table.concat({repo_a,agent_task_id,'herdr'},'\0'))end),'conflict attach cleanup')
+vim.notify=original_notify
+contains(table.concat(conflict_notifications,'\n'),'already has an attached client')
 
 input_responses[#input_responses + 1] = 'Reply with only OK'
 press('p')
@@ -190,6 +206,7 @@ local bind_rows = assert(tasks.list_tasks({ scope = 'repo', repo = repo_a }))
 local bind_task_id = bind_rows[#bind_rows].task.id
 select_responses[#select_responses + 1] = choose(existing_identity.pane_id)
 press('b')
+assert(vim.wait(10000,function() return task_from(repo_a,bind_task_id).agent~=vim.NIL end),'live picker bind timeout')
 local bound_task = task_from(repo_a, bind_task_id)
 eq(bound_task.agent.terminal_id, existing_identity.terminal_id, 'b links the selected existing agent')
 eq(bound_task.status, 'todo', 'binding through the UI leaves the task in Todo')
@@ -201,6 +218,7 @@ select_responses[#select_responses + 1] = choose(existing_identity.pane_id)
 local saved_notify, notifications = vim.notify, {}
 vim.notify = function(message) notifications[#notifications + 1] = tostring(message) end
 press('b')
+assert(vim.wait(10000,function() return #notifications>0 end),'duplicate warning timeout')
 vim.notify = saved_notify
 eq(task_from(repo_a, duplicate_bind_id).agent, vim.NIL, 'binding an already-linked agent leaves the second task unlinked')
 contains(table.concat(notifications, '\n'), 'already linked')
@@ -305,5 +323,53 @@ assert(callback_ok, 'late Herdr result does not update a closed buffer')
 vim.wait(20)
 herdr.list = regular_list
 
+vim.api.nvim_set_current_dir(repo_a)
+assert(board.open({scope='repo',repo=repo_a}))
+board_buf=vim.api.nvim_get_current_buf()
+local native_id='12345678-1234-4234-8234-123456789abc'
+vim.env.CLAUDE_CONFIG_DIR=root..'/claude'
+vim.fn.mkdir(root..'/claude/projects/repo','p')
+local history=assert(io.open(root..'/claude/projects/repo/'..native_id..'.jsonl','w'))
+history:write(vim.json.encode({type='user',sessionId=native_id,cwd=repo_a,timestamp='2026-10-07T00:00:00Z'}),'\n')
+history:write(vim.json.encode({type='ai-title',sessionId=native_id,aiTitle='Offline fixture'}),'\n');history:close()
+input_responses[#input_responses+1]='Offline linked task'
+press('n')
+local offline_rows=assert(tasks.list_tasks({scope='repo',repo=repo_a}))
+local offline_id=offline_rows[#offline_rows].task.id
+local before_bind_starts=starts
+select_responses[#select_responses+1]=function(items,opts)
+  for _,row in ipairs(items) do if row.conversation and row.conversation.session_id==native_id then
+    contains(opts.format_item(row),'Offline fixture');contains(opts.format_item(row),'offline');contains(opts.format_item(row),'2026-10-07')
+    return row
+  end end
+  error('offline Claude session missing from picker')
+end
+press('b')
+assert(vim.wait(10000,function() return task_from(repo_a,offline_id).conversation~=vim.NIL end),'offline picker binding')
+eq(starts,before_bind_starts,'picker binds without launching')
+board.refresh();vim.wait(50)
+contains(lines(board_buf),'claude · offline')
+local real_open=api.open_agent
+local open_requests=0
+api.open_agent=function(ref,cb,opts) open_requests=open_requests+1;assert(ref.id==offline_id);cb(true) end
+press('<CR>');press('a')
+eq(open_requests,2,'Enter and a open the linked conversation')
+api.open_agent=real_open
+local helped=false
+select_responses[#select_responses+1]=function(items)
+ local text=table.concat(items,'\n');contains(text,'resume');contains(text,'Ctrl-');contains(text,'history');helped=true
+end
+press('?');assert(helped,'board-local help missing')
+board.close()
+local owner=vim.api.nvim_get_current_tabpage()
+vim.cmd('tabnew')
+local other=vim.api.nvim_get_current_tabpage()
+local closed,closed_error=terminal.open('wrong-tab',existing_identity,{tabpage=owner,label='Fixture'})
+assert(not closed and closed_error.code=='owner_unavailable','async open must not use unrelated tab')
+vim.api.nvim_set_current_tabpage(owner)
+vim.cmd('tabclose')
+assert(vim.api.nvim_get_current_tabpage()==other)
+local invalid,invalid_error=terminal.open('closed-owner',existing_identity,{tabpage=owner})
+assert(not invalid and invalid_error.code=='owner_unavailable','closed owner rejected')
 vim.fn.delete(root, 'rf')
 print('agent-board ui e2e passed')

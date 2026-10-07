@@ -7,7 +7,7 @@ end
 
 local function document_template(kind)
   if kind == 'board' then
-    return { version = 1, revision = 0, tasks = {} }
+    return { version = 2, revision = 0, tasks = {} }
   end
   if kind == 'registry' then
     return { version = 1, revision = 0, repos = {} }
@@ -49,7 +49,7 @@ local function validate_agent(agent)
 end
 
 local function validate(document, kind)
-  if type(document) ~= 'table' or not valid_revision(document.revision) or document.version ~= 1 then
+  if type(document) ~= 'table' or not valid_revision(document.revision) or (document.version ~= 1 and not (kind == 'board' and document.version == 2)) then
     return false, 'document version or revision is invalid'
   end
 
@@ -68,6 +68,17 @@ local function validate(document, kind)
       ids[task.id] = true
       if task.status ~= 'todo' and task.status ~= 'doing' and task.status ~= 'done' then
         return false, 'task status must be todo, doing, or done'
+      end
+      if task.pending_start ~= nil and type(task.pending_start) ~= 'boolean' then
+        return false, 'pending_start must be a boolean'
+      end
+      local conversation = task.conversation
+      if conversation ~= nil and conversation ~= vim.NIL then
+        if type(conversation) ~= 'table' or conversation.provider ~= 'claude'
+          or not require('agent-board.claude').valid_id(conversation.session_id)
+          or type(conversation.cwd) ~= 'string' or conversation.cwd:sub(1,1) ~= '/' then
+          return false, 'conversation needs a Claude UUID and absolute cwd'
+        end
       end
       local agent_ok, agent_error = validate_agent(task.agent)
       if not agent_ok then
@@ -139,6 +150,10 @@ function M.read(path, kind)
   local valid, validation_error = validate(document, kind)
   if not valid then
     return failure('invalid ' .. kind .. ' in ' .. path .. ': ' .. validation_error)
+  end
+  if kind == 'board' then
+    document.version = 2
+    for _, task in ipairs(document.tasks) do task.conversation = task.conversation or vim.NIL end
   end
   return document, { data = data, kind = kind, revision = document.revision }
 end

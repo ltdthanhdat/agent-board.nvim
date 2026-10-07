@@ -107,8 +107,14 @@ end
 
 local function item_detail(state, item)
   local agent = item.task.agent
+  local conversation = item.task.conversation
+  if has_agent(conversation) then
+    local label = state.runtime_error and 'runtime unknown' or
+      (item.task.pending_start and 'start unverified' or (state.native_states and state.native_states[conversation.session_id]) or (state.native_unknown and 'runtime unknown' or (state.checked and 'offline' or 'checking')))
+    return 'claude · ' .. label
+  end
   if not has_agent(agent) then return '' end
-  return agent.provider .. ' · ' .. (agent_state(state, agent) or 'unknown')
+  return agent.provider .. ' · ' .. (agent_state(state, agent) or 'unknown') .. (agent.provider == 'claude' and ' · resume unavailable' or '')
 end
 
 local function columns_for(rows)
@@ -331,45 +337,57 @@ local function action_choose_status(state)
 end
 
 local function action_start(state)
-  local ref = selected_ref(state)
+  local ref, item = selected_ref(state)
   if not ref then return end
+  if has_agent(item.task.conversation) then
+    return api.open_agent(ref, function(value, err) refresh_after(state, value, err) end, {tabpage=state.tab,label=item.task.title})
+  end
   choose({ 'claude', 'codex', 'pi' }, 'Start agent with:', function(provider)
     if not provider then return end
-    api.start_agent(ref, { provider = provider, expected_snapshot = state.snapshots[ref.repo] }, function(value, err)
+    api.start_agent(ref, { provider = provider, expected_snapshot = state.snapshots[ref.repo], terminal_opts = {tabpage=state.tab,label=item.task.title} }, function(value, err)
       refresh_after(state, value, err)
     end)
   end)
 end
 
 local function action_bind(state)
-  local ref = selected_ref(state)
+  local ref, item = selected_ref(state)
   if not ref then return end
-  herdr.list(function(agents, err)
-    if err then return notify(show_error(err)) end
-    choose(agents, 'Link running agent:', function(agent)
-      if not agent then return end
-      api.bind_agent(ref, agent.identity, state.snapshots[ref.repo], function(value, bind_error)
-        refresh_after(state, value, bind_error)
-      end)
-    end, function(agent)
-      return ('%s · %s · %s · %s'):format(agent.identity.provider, agent.cwd or '?', agent.state, agent.identity.name or agent.identity.pane_id)
+  if has_agent(item.task.agent) or has_agent(item.task.conversation) then return notify('task already has a linked session') end
+  api.list_sessions(ref, function(discovery, err)
+    if not current(state) then return end
+    if not discovery then return notify(show_error(err)) end
+    for _, warning in ipairs(discovery.warnings) do notify(warning) end
+    if discovery.runtime_error then notify('Herdr runtime unknown; opening requires a successful runtime check') end
+    choose(discovery.sessions, 'Link session:', function(session)
+      if not session or not current(state) then return end
+      if session.bound then return notify('this session is already linked to a task') end
+      if session.state == 'unavailable' or session.ambiguous then return notify(session.reason or 'Session unavailable') end
+      local callback = function(value, bind_error) refresh_after(state, value, bind_error) end
+      if session.conversation then
+        api.bind_conversation(ref, session.conversation, state.snapshots[ref.repo], callback)
+      elseif session.agent then
+        api.bind_agent(ref, session.agent.identity, state.snapshots[ref.repo], callback)
+      end
+    end, function(session)
+      local provider = session.conversation and 'claude' or session.agent.identity.provider
+      return table.concat({provider, session.title, session.updated_at or '', session.state,
+        session.bound and ('already linked: ' .. session.bound_title) or (session.reason or '')}, ' · ')
     end)
   end)
 end
 
 local function action_open(state)
   local ref, item = selected_ref(state)
-  if not item or not has_agent(item.task.agent) then return end
+  if not item or not (has_agent(item.task.agent) or has_agent(item.task.conversation)) then return end
   api.open_agent(ref, function(_, err)
-    if err then
-      notify(err.code == 'offline' and 'agent is offline; press a to start a new session' or show_error(err))
-    end
-  end)
+    if err then notify(show_error(err)) end
+  end, {tabpage=state.tab,label=item.task.title})
 end
 
 local function action_send(state)
   local ref, item = selected_ref(state)
-  if not item or not has_agent(item.task.agent) then return end
+  if not item or not (has_agent(item.task.agent) or has_agent(item.task.conversation)) then return end
   vim.ui.input({ prompt = 'Prompt: ' }, function(message)
     if not message or message == '' then return end
     api.send(ref, message, function(_, err)
@@ -387,7 +405,7 @@ end
 local function action_delete(state)
   local ref, item = selected_ref(state)
   if not item then return end
-  confirm(state, 'Delete task and its link?', 'Delete', function()
+  confirm(state, 'Delete task and link? Claude history and running agent are kept.', 'Delete', function()
     local deleted, err = api.delete_task(ref, state.snapshots[ref.repo])
     if not deleted then return notify(show_error(err)) end
     state.selected = nil
@@ -397,8 +415,8 @@ end
 
 local function action_stop(state)
   local ref, item = selected_ref(state)
-  if not item or not has_agent(item.task.agent) then return end
-  confirm(state, 'Stop this agent and close its Herdr pane?', 'Stop', function()
+  if not item or not (has_agent(item.task.agent) or has_agent(item.task.conversation)) then return end
+  confirm(state, 'Stop runtime? Conversation history and task status are kept.', 'Stop', function()
     api.stop_agent(ref, function(_, err)
       if err then return notify(show_error(err)) end
       M.refresh()
@@ -483,6 +501,18 @@ local function install_mappings(state)
   map(state, 'j', function(s) move_card(s, 1) end)
   map(state, 'k', function(s) move_card(s, -1) end)
   map(state, 'g', action_scope)
+  map(state, '?', function()
+    choose({
+      'n new task · r rename · m move · d done',
+      'a start new Claude session, or open/resume the linked conversation',
+      'b link a running or saved Claude session; selection does not launch it',
+      'Enter attach running agent or resume the same saved Claude UUID',
+      'Ctrl-\\ Ctrl-n then q hides the terminal; its runtime keeps running',
+      's stop runtime, keep conversation history and task status',
+      'x delete task/link, keep history and running runtime',
+      'h/l columns · j/k tasks · g scope · p prompt · q close board',
+    }, 'AgentBoard keys:', function() end)
+  end)
   map(state, 'q', function() M.close() end)
 end
 
@@ -547,9 +577,15 @@ function M.refresh()
       state.checked = not err
       state.runtime_error = err ~= nil
       state.agent_states = {}
+      state.native_states = {}
+      state.native_unknown = false
       if not err then
         for _, agent in ipairs(agents) do
           state.agent_states[agent.identity.server .. '\0' .. agent.identity.terminal_id] = agent.state
+          if agent.identity.provider == 'claude' then
+            if require('agent-board.claude').valid_id(agent.identity.session_id) then state.native_states[agent.identity.session_id] = 'running'
+            else state.native_unknown = true end
+          end
         end
       end
       render(state)
