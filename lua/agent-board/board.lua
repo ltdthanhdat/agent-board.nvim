@@ -1,12 +1,11 @@
 local api = require('agent-board')
 local tasks = require('agent-board.tasks')
 local herdr = require('agent-board.herdr')
+local session_picker = require('agent-board.session_picker')
 local uv = vim.uv
 local M = {}
-
-local statuses = { 'todo', 'doing', 'done' }
-local status_labels = { todo = 'Todo', doing = 'Doing', done = 'Done' }
 local active
+local close_help
 
 local function notify(message, level)
   vim.notify('agent-board: ' .. tostring(message), level or vim.log.levels.WARN)
@@ -54,6 +53,7 @@ end
 local function close_state(state)
   if state.closed then return end
   state.closed = true
+  if close_help then close_help(state) end
   stop_timer(state)
   if active == state then active = nil end
 end
@@ -82,16 +82,16 @@ local function fit(text, width)
   return result .. string.rep(' ', math.max(0, width - display_width(result)))
 end
 
-local function repo_labels(rows)
+local function repo_labels(projects)
   local counts, labels = {}, {}
-  for _, row in ipairs(rows) do
-    local name = vim.fn.fnamemodify(row.repo, ':t')
+  for _, project in ipairs(projects) do
+    local name = vim.fn.fnamemodify(project.repo, ':t')
     counts[name] = (counts[name] or 0) + 1
   end
-  for _, row in ipairs(rows) do
-    local name = vim.fn.fnamemodify(row.repo, ':t')
-    labels[row.repo] = counts[name] > 1
-      and (vim.fn.fnamemodify(row.repo, ':h:t') .. '/' .. name)
+  for _, project in ipairs(projects) do
+    local name = vim.fn.fnamemodify(project.repo, ':t')
+    labels[project.repo] = counts[name] > 1
+      and (vim.fn.fnamemodify(project.repo, ':h:t') .. '/' .. name)
       or name
   end
   return labels
@@ -107,118 +107,273 @@ end
 
 local function item_detail(state, item)
   local agent = item.task.agent
-  if not has_agent(agent) then return '' end
-  return agent.provider .. ' · ' .. (agent_state(state, agent) or 'unknown')
-end
-
-local function columns_for(rows)
-  local columns = { {}, {}, {} }
-  for _, row in ipairs(rows) do
-    local index = row.task.status == 'todo' and 1 or row.task.status == 'doing' and 2 or 3
-    columns[index][#columns[index] + 1] = row
+  local conversation = item.task.conversation
+  if has_agent(conversation) then
+    local label = state.runtime_error and 'runtime unknown' or
+      (item.task.pending_start and 'start unverified' or (state.native_states and state.native_states[conversation.session_id]) or (state.native_unknown and 'runtime unknown' or (state.checked and 'offline' or 'checking')))
+    return 'claude · ' .. label
   end
-  return columns
+  if not has_agent(agent) then return '' end
+  return agent.provider .. ' · ' .. (agent_state(state, agent) or 'unknown') .. (agent.provider == 'claude' and ' · resume unavailable' or '')
 end
 
-local function join_cells(cells)
-  local offsets, parts, bytes = {}, {}, 0
-  for column = 1, 3 do
-    offsets[column] = bytes
-    parts[#parts + 1] = cells[column]
-    bytes = bytes + #cells[column]
-    if column < 3 then
-      parts[#parts + 1] = ' │ '
-      bytes = bytes + #' │ '
+local function join_panels(cells)
+  local offsets, sizes, parts, bytes = {}, {}, {}, 0
+  for column, cell in ipairs(cells) do
+    offsets[column], sizes[column] = bytes, #cell
+    parts[#parts + 1] = cell
+    bytes = bytes + #cell
+    if column < #cells then
+      parts[#parts + 1] = '  '
+      bytes = bytes + 2
     end
   end
-  return table.concat(parts), offsets
+  return table.concat(parts), offsets, sizes
+end
+
+local function join_cells(cells, width)
+  local panels = {}
+  for column, cell in ipairs(cells) do
+    panels[column] = '│ ' .. fit(cell, width) .. ' │'
+  end
+  local line, offsets, sizes = join_panels(panels)
+  local content_offsets = {}
+  for column, offset in ipairs(offsets) do content_offsets[column] = offset + #'│ ' end
+  return line, offsets, content_offsets, sizes
+end
+
+local function panel_border(width, left, right)
+  return left .. string.rep('─', math.max(0, width - 2)) .. right
+end
+
+local function join_borders(count, width, left, right)
+  local cells = {}
+  for column = 1, count do cells[column] = panel_border(width, left, right) end
+  return join_panels(cells)
+end
+
+local function build_project_views(state)
+  local views = {}
+  for _, project in ipairs(state.projects or {}) do
+    local view = { project = project, lanes = {} }
+    for lane_index, lane in ipairs(project.lanes) do
+      view.lanes[lane_index] = { lane = lane, rows = {} }
+    end
+    for _, row in ipairs(state.rows) do
+      if row.repo == project.repo then
+        for _, lane in ipairs(view.lanes) do
+          if lane.lane.id == row.task.status then
+            lane.rows[#lane.rows + 1] = row
+            break
+          end
+        end
+      end
+    end
+    views[#views + 1] = view
+  end
+  state.project_views = views
 end
 
 local function find_selection(state)
   if state.selected then
-    for column, rows in ipairs(state.columns) do
-      for index, row in ipairs(rows) do
-        if ref_key(row.repo, row.task.id) == state.selected then
-          state.focus_column, state.focus_index = column, index
-          return
+    for project_index, project in ipairs(state.project_views) do
+      for lane_index, lane in ipairs(project.lanes) do
+        for item_index, row in ipairs(lane.rows) do
+          if ref_key(row.repo, row.task.id) == state.selected then
+            state.focus_project = project_index
+            state.lane_focus[project.project.repo] = lane_index
+            state.focus_index = item_index
+            return
+          end
         end
       end
     end
   end
-  for column, rows in ipairs(state.columns) do
-    if #rows > 0 then
-      state.focus_column, state.focus_index = column, 1
-      state.selected = ref_key(rows[1].repo, rows[1].task.id)
-      return
-    end
-  end
-  state.focus_column = math.min(state.focus_column or 1, 3)
-  state.focus_index = 0
+
   state.selected = nil
+  state.focus_project = math.max(1, math.min(state.focus_project or 1, #state.project_views))
+  local project = state.project_views[state.focus_project]
+  if not project then state.focus_index = 0; return end
+  local lane_index = math.max(1, math.min(state.lane_focus[project.project.repo] or 1, #project.lanes))
+  state.lane_focus[project.project.repo] = lane_index
+  local rows = project.lanes[lane_index] and project.lanes[lane_index].rows or {}
+  state.focus_index = #rows > 0 and 1 or 0
+  if rows[1] then state.selected = ref_key(rows[1].repo, rows[1].task.id) end
 end
 
 local function render(state)
   if not current(state) then return end
-  state.columns = columns_for(state.rows)
+  build_project_views(state)
   find_selection(state)
-  local width = math.max(12, math.floor((vim.o.columns - 6) / 3))
-  local labels = repo_labels(state.rows)
-  local lines, line_map, row_offsets, card_lines = {}, {}, {}, { {}, {}, {} }
+
+  local window_width = vim.api.nvim_win_is_valid(state.win)
+    and math.min(vim.o.columns, vim.api.nvim_win_get_width(state.win))
+    or vim.o.columns
+  local narrow = window_width < 64
+  local visible_count = narrow and 1 or 3
+  local board_width = math.max(12, window_width - 2)
+  local panel_width = narrow and board_width or math.max(12, math.floor((board_width - 4) / 3))
+  local width = math.max(8, panel_width - 4)
+  local labels = repo_labels(state.projects or {})
+  local lines, line_map, row_offsets, highlights, project_render = {}, {}, {}, {}, {}
+  local line_groups = {}
+  local function append(line, group)
+    lines[#lines + 1] = line
+    line_groups[#lines] = group
+    return #lines
+  end
+
   local scope_label = state.scope == 'global' and 'global' or ('repo ' .. state.repo)
-  lines[#lines + 1] = 'AgentBoard · ' .. scope_label
-  if state.error then lines[#lines + 1] = 'Error: ' .. state.error end
-  if state.runtime_error then lines[#lines + 1] = 'Herdr runtime unavailable' end
+  append('╭' .. fit(' ◆ AgentBoard · ' .. scope_label .. ' ', board_width - 2) .. '╮', 'AgentBoardTitle')
+  if state.error then append(fit('Error: ' .. state.error, board_width), 'DiagnosticError') end
+  if state.runtime_error then append(fit('Herdr runtime unavailable', board_width), 'DiagnosticWarn') end
   for _, warning in ipairs(state.warnings or {}) do
-    lines[#lines + 1] = 'Warning: ' .. warning.repo .. ' · ' .. warning.error
+    append(fit('Warning: ' .. warning.repo .. ' · ' .. warning.error, board_width), 'DiagnosticWarn')
   end
-  local heading_row = #lines + 1
-  local headings = {}
-  for index, label in ipairs({ 'Todo', 'Doing', 'Done' }) do headings[index] = fit(label, width) end
-  lines[#lines + 1], row_offsets[heading_row] = join_cells(headings)
+  if #state.project_views == 0 then append(fit('No registered projects. Open a repository with :AgentBoard first.', board_width), 'Comment') end
 
-  local count = math.max(#state.columns[1], #state.columns[2], #state.columns[3])
-  if count == 0 then
-    lines[#lines + 1] = table.concat({ fit('(empty)', width), fit('(empty)', width), fit('(empty)', width) }, ' │ ')
-  end
-  for index = 1, count do
-    local title_cells, detail_cells = {}, {}
-    for column = 1, 3 do
-      local item = state.columns[column][index]
-      if item then
-        local title = item.task.title
-        if state.scope == 'global' then title = '[' .. labels[item.repo] .. '] ' .. title end
-        title_cells[column] = fit(title, width)
-        detail_cells[column] = fit(item_detail(state, item), width)
-      else
-        title_cells[column], detail_cells[column] = string.rep(' ', width), string.rep(' ', width)
+  for project_index, project_view in ipairs(state.project_views) do
+    if not narrow or project_index == state.focus_project then
+      if #lines > 1 then append('') end
+      local project = project_view.project
+      append('Project · ' .. labels[project.repo], 'AgentBoardProject')
+      local lane_count = #project_view.lanes
+      local focus_lane = math.max(1, math.min(state.lane_focus[project.repo] or 1, lane_count))
+      state.lane_focus[project.repo] = focus_lane
+      local shown_count = math.min(visible_count, lane_count)
+      local start_lane = narrow and focus_lane or math.max(1, math.min(focus_lane - math.floor(visible_count / 2), lane_count - shown_count + 1))
+      local lane_cells, shown_lanes = {}, {}
+      local project_task_count = 0
+      for _, lane in ipairs(project_view.lanes) do project_task_count = project_task_count + #lane.rows end
+      for column = 1, shown_count do
+        local lane_index = start_lane + column - 1
+        local lane_view = project_view.lanes[lane_index]
+        shown_lanes[column] = { index = lane_index, view = lane_view }
+        local marker = lane_index == focus_lane and '▸ ' or '  '
+        lane_cells[column] = marker .. lane_view.lane.name .. ' (' .. #lane_view.rows .. ')'
       end
-    end
-    local title_line, title_offsets = join_cells(title_cells)
-    lines[#lines + 1] = title_line
-    local title_row = #lines
-    row_offsets[title_row] = title_offsets
-    local detail_line, detail_offsets = join_cells(detail_cells)
-    lines[#lines + 1] = detail_line
-    local detail_row = #lines
-    row_offsets[detail_row] = detail_offsets
-    for column = 1, 3 do
-      local item = state.columns[column][index]
-      if item then
-        line_map[title_row] = line_map[title_row] or {}
-        line_map[detail_row] = line_map[detail_row] or {}
-        line_map[title_row][column], line_map[detail_row][column] = item, item
-        card_lines[column][index] = title_row
+      local top_line, top_offsets, top_sizes = join_borders(shown_count, panel_width, '╭', '╮')
+      local top_row = append(top_line, 'AgentBoardLaneBorder')
+      local heading_line, heading_cell_offsets, heading_offsets, heading_sizes = join_cells(lane_cells, width)
+      local heading_row = append(heading_line, 'AgentBoardLane')
+      row_offsets[heading_row] = heading_offsets
+      local lane_divider, lane_divider_offsets, lane_divider_sizes = join_borders(shown_count, panel_width, '├', '┤')
+      local lane_divider_row = append(lane_divider, 'AgentBoardLaneBorder')
+      for column, item in ipairs(shown_lanes) do
+        if project_index == state.focus_project and item.index == focus_lane then
+          highlights[#highlights + 1] = { row = top_row, first = top_offsets[column], last = top_offsets[column] + top_sizes[column], group = 'AgentBoardLaneFocus' }
+          highlights[#highlights + 1] = { row = heading_row, first = heading_cell_offsets[column], last = heading_cell_offsets[column] + heading_sizes[column], group = 'AgentBoardLaneFocus' }
+          highlights[#highlights + 1] = { row = lane_divider_row, first = lane_divider_offsets[column], last = lane_divider_offsets[column] + lane_divider_sizes[column], group = 'AgentBoardLaneFocus' }
+        end
       end
+      local card_lines = {}
+      for column = 1, shown_count do card_lines[column] = {} end
+      local card_count = 0
+      for _, item in ipairs(shown_lanes) do card_count = math.max(card_count, #item.view.rows) end
+      if card_count == 0 then
+        local empty = {}
+        for column = 1, shown_count do empty[column] = project_task_count == 0 and column == 1 and 'No tasks · n new · + lane' or '— empty —' end
+        local empty_line_text = join_cells(empty, width)
+        append(empty_line_text, 'Comment')
+      end
+      for index = 1, card_count do
+        local title_cells, detail_cells, visible_items = {}, {}, {}
+        for column, item in ipairs(shown_lanes) do
+          local row = item.view.rows[index]
+          visible_items[column] = row
+          if row then
+            local selected = ref_key(row.repo, row.task.id) == state.selected
+            title_cells[column] = (selected and '▶ ' or '  ') .. row.task.title
+            detail_cells[column] = item_detail(state, row) ~= '' and item_detail(state, row) or 'no linked session'
+          else
+            title_cells[column], detail_cells[column] = string.rep(' ', width), string.rep(' ', width)
+          end
+        end
+        local title_line, title_cell_offsets, title_offsets, title_sizes = join_cells(title_cells, width)
+        local title_row = append(title_line, 'AgentBoardCard')
+        row_offsets[title_row] = title_offsets
+        local detail_line, detail_cell_offsets, detail_offsets, detail_sizes = join_cells(detail_cells, width)
+        local detail_row = append(detail_line, 'Comment')
+        row_offsets[detail_row] = detail_offsets
+        for column = 1, shown_count do
+          local row = visible_items[column]
+          if row then
+            line_map[title_row] = line_map[title_row] or {}
+            line_map[detail_row] = line_map[detail_row] or {}
+            line_map[title_row][column], line_map[detail_row][column] = row, row
+            card_lines[column][index] = title_row
+            if ref_key(row.repo, row.task.id) == state.selected then
+              local first = title_cell_offsets[column]
+              local last = first + title_sizes[column]
+              highlights[#highlights + 1] = { row = title_row, first = first, last = last, group = 'AgentBoardSelected' }
+              highlights[#highlights + 1] = { row = detail_row, first = detail_cell_offsets[column], last = detail_cell_offsets[column] + detail_sizes[column], group = 'AgentBoardSelected' }
+            end
+          end
+        end
+        if index < card_count then
+          local divider, divider_offsets, divider_sizes = join_borders(shown_count, panel_width, '├', '┤')
+          local divider_row = append(divider, 'AgentBoardLaneBorder')
+          for column, item in ipairs(shown_lanes) do
+            if project_index == state.focus_project and item.index == focus_lane then
+              highlights[#highlights + 1] = { row = divider_row, first = divider_offsets[column], last = divider_offsets[column] + divider_sizes[column], group = 'AgentBoardLaneFocus' }
+            end
+          end
+        end
+      end
+      local bottom_line, bottom_offsets, bottom_sizes = join_borders(shown_count, panel_width, '╰', '╯')
+      local bottom_row = append(bottom_line, 'AgentBoardLaneBorder')
+      for column, item in ipairs(shown_lanes) do
+        if project_index == state.focus_project and item.index == focus_lane then
+          highlights[#highlights + 1] = { row = bottom_row, first = bottom_offsets[column], last = bottom_offsets[column] + bottom_sizes[column], group = 'AgentBoardLaneFocus' }
+        end
+      end
+      project_render[project.repo] = {
+        project_index = project_index,
+        start_lane = start_lane,
+        shown_lanes = shown_lanes,
+        heading_row = heading_row,
+        card_lines = card_lines,
+      }
     end
   end
 
-  state.line_map, state.row_offsets, state.card_lines, state.heading_row = line_map, row_offsets, card_lines, heading_row
+  local active_project = state.project_views[state.focus_project]
+  local cursor_position
+  if active_project then
+    local rendered = project_render[active_project.project.repo]
+    local lane_index = state.lane_focus[active_project.project.repo] or 1
+    local column = rendered and lane_index - rendered.start_lane + 1 or 1
+    local row = rendered and (rendered.card_lines[column] and rendered.card_lines[column][state.focus_index] or rendered.heading_row) or 1
+    local col = (row_offsets[row] or {})[column] or 0
+    state.heading_row = rendered and rendered.heading_row or 1
+    cursor_position = { row, col }
+  end
+
+  local footer
+  if narrow then
+    footer = state.scope == 'global'
+      and 'h/l lanes · [ ] projects · ? help · q close'
+      or 'h/l lanes · ? help · q close'
+  else
+    footer = state.scope == 'global'
+      and 'n new · + lane · R rename · m move · h/l lanes · [ ] projects · ? help · q close'
+      or 'n new · + lane · R rename · m move · h/l lanes · ? help · q close'
+  end
+  append('╰' .. fit(' ' .. footer .. ' ', board_width - 2) .. '╯', 'AgentBoardFooter')
+  state.line_map, state.row_offsets, state.project_render, state.highlights = line_map, row_offsets, project_render, highlights
   vim.bo[state.buf].modifiable = true
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
   vim.bo[state.buf].modifiable = false
-  if vim.api.nvim_win_is_valid(state.win) then
-    local row = card_lines[state.focus_column][state.focus_index] or heading_row
-    vim.api.nvim_win_set_cursor(state.win, { row, (row_offsets[row] or {})[state.focus_column] or 0 })
+  if not state.ns then state.ns = vim.api.nvim_create_namespace('AgentBoard') end
+  vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
+  for line, group in pairs(line_groups) do
+    vim.api.nvim_buf_add_highlight(state.buf, state.ns, group, line - 1, 0, -1)
+  end
+  for _, mark in ipairs(highlights) do
+    vim.api.nvim_buf_add_highlight(state.buf, state.ns, mark.group, mark.row - 1, mark.first, mark.last)
+  end
+  if cursor_position and vim.api.nvim_win_is_valid(state.win) then
+    vim.api.nvim_win_set_cursor(state.win, cursor_position)
   end
 end
 
@@ -233,14 +388,14 @@ local function show_error(err)
 end
 
 local function reload_rows(state)
-  local rows, warnings, snapshots = api.list_tasks({ scope = state.scope, repo = state.repo })
+  local rows, warnings, snapshots, projects = api.list_tasks({ scope = state.scope, repo = state.repo })
   if not rows then
     state.error = show_error(warnings)
     render(state)
     return nil, warnings
   end
   state.error = nil
-  state.rows, state.warnings, state.snapshots = rows, warnings, snapshots
+  state.rows, state.warnings, state.snapshots, state.projects = rows, warnings, snapshots, projects
   render(state)
   return true
 end
@@ -254,6 +409,7 @@ local function current_item(state)
   end
   local item = (state.line_map[row] or {})[column]
   if item then state.selected = ref_key(item.repo, item.task.id) end
+  if not item then state.selected = nil end
   return item
 end
 
@@ -334,53 +490,105 @@ local function action_choose_status(state)
   local ref = selected_ref(state)
   if not ref then return end
   local expected_snapshot = state.snapshots[ref.repo]
-  choose(statuses, 'Move task to:', function(status)
-    if status then action_move(state, status, ref, expected_snapshot) end
-  end, function(status) return status_labels[status] end)
+  local project
+  for _, candidate in ipairs(state.projects or {}) do
+    if candidate.repo == ref.repo then project = candidate; break end
+  end
+  if not project then return notify('repository lanes are unavailable') end
+  choose(project.lanes, 'Move task to:', function(lane)
+    if lane then action_move(state, lane.id, ref, expected_snapshot) end
+  end, function(lane) return lane.name end)
+end
+
+local function focused_project(state)
+  return state.projects and state.projects[state.focus_project]
+end
+
+local function focused_lane(state)
+  local project = focused_project(state)
+  if not project then return nil end
+  return project.lanes[state.lane_focus[project.repo] or 1]
+end
+
+local function action_add_lane(state)
+  local project = focused_project(state)
+  if not project then return end
+  vim.ui.input({ prompt = 'New lane: ' }, function(name)
+    if not name or name:match('^%s*$') then return end
+    local lane, err = api.add_lane(project.repo, name, state.snapshots[project.repo])
+    if not lane then return notify(show_error(err)) end
+    state.selected = nil
+    state.lane_focus[project.repo] = #project.lanes + 1
+    M.refresh()
+  end)
+end
+
+local function action_rename_lane(state)
+  local project, lane = focused_project(state), focused_lane(state)
+  if not project or not lane then return end
+  vim.ui.input({ prompt = 'Rename lane: ', default = lane.name }, function(name)
+    if not name or name:match('^%s*$') then return end
+    local renamed, err = api.rename_lane(project.repo, lane.id, name, state.snapshots[project.repo])
+    if not renamed then return notify(show_error(err)) end
+    M.refresh()
+  end)
 end
 
 local function action_start(state)
-  local ref = selected_ref(state)
+  local ref, item = selected_ref(state)
   if not ref then return end
   local expected_snapshot = state.snapshots[ref.repo]
+  if has_agent(item.task.conversation) then
+    return api.open_agent(ref, function(value, err) refresh_after(state, value, err) end, {tabpage=state.tab,label=item.task.title})
+  end
   choose({ 'claude', 'codex', 'pi' }, 'Start agent with:', function(provider)
     if not provider then return end
-    api.start_agent(ref, { provider = provider, expected_snapshot = expected_snapshot }, function(value, err)
+    api.start_agent(ref, { provider = provider, expected_snapshot = expected_snapshot, terminal_opts = {tabpage=state.tab,label=item.task.title} }, function(value, err)
       refresh_after(state, value, err)
     end)
   end)
 end
 
 local function action_bind(state)
-  local ref = selected_ref(state)
+  local ref, item = selected_ref(state)
   if not ref then return end
   local expected_snapshot = state.snapshots[ref.repo]
-  herdr.list(function(agents, err)
-    if err then return notify(show_error(err)) end
-    choose(agents, 'Link running agent:', function(agent)
-      if not agent then return end
-      api.bind_agent(ref, agent.identity, expected_snapshot, function(value, bind_error)
-        refresh_after(state, value, bind_error)
-      end)
-    end, function(agent)
-      return ('%s · %s · %s · %s'):format(agent.identity.provider, agent.cwd or '?', agent.state, agent.identity.name or agent.identity.pane_id)
+  if has_agent(item.task.conversation) then return notify('task already has a linked session') end
+  api.list_sessions(ref, function(discovery, err)
+    if not current(state) then return end
+    if not discovery then return notify(show_error(err)) end
+    for _, warning in ipairs(discovery.warnings) do notify(warning) end
+    if discovery.runtime_error then notify('Herdr runtime unknown; opening requires a successful runtime check') end
+    if #discovery.sessions==0 then return notify('nothing to select') end
+    session_picker.open(discovery.sessions, {prompt='Link session:',format_item=function(session)
+      local provider = session.conversation and 'claude' or session.agent.identity.provider
+      return table.concat({provider, session.title, session.updated_at or '', session.state,
+        session.bound and ('already linked: ' .. session.bound_title) or (session.reason or '')}, ' · ')
+    end}, function(session)
+      if not session or not current(state) then return end
+      if session.bound then return notify('this session is already linked to a task') end
+      if session.state == 'unavailable' or session.ambiguous then return notify(session.reason or 'Session unavailable') end
+      local callback = function(value, bind_error) refresh_after(state, value, bind_error) end
+      if session.conversation then
+        api.bind_conversation(ref, session.conversation, expected_snapshot, callback)
+      elseif session.agent then
+        api.bind_agent(ref, session.agent.identity, expected_snapshot, callback)
+      end
     end)
   end)
 end
 
 local function action_open(state)
   local ref, item = selected_ref(state)
-  if not item or not has_agent(item.task.agent) then return end
+  if not item or not (has_agent(item.task.agent) or has_agent(item.task.conversation)) then return end
   api.open_agent(ref, item.task.agent, function(_, err)
-    if err then
-      notify(err.code == 'offline' and 'agent is offline; press a to start a new session' or show_error(err))
-    end
-  end)
+    if err then notify(show_error(err)) end
+  end, {tabpage=state.tab,label=item.task.title})
 end
 
 local function action_send(state)
   local ref, item = selected_ref(state)
-  if not item or not has_agent(item.task.agent) then return end
+  if not item or not (has_agent(item.task.agent) or has_agent(item.task.conversation)) then return end
   vim.ui.input({ prompt = 'Prompt: ' }, function(message)
     if not message or message == '' then return end
     api.send(ref, message, item.task.agent, function(_, err)
@@ -399,7 +607,7 @@ local function action_delete(state)
   local ref, item = selected_ref(state)
   if not item then return end
   local expected_snapshot = state.snapshots[ref.repo]
-  confirm(state, 'Delete task and its link?', 'Delete', function()
+  confirm(state, 'Delete task and link? Claude history and running agent are kept.', 'Delete', function()
     local deleted, err = api.delete_task(ref, expected_snapshot)
     if not deleted then return notify(show_error(err)) end
     state.selected = nil
@@ -409,8 +617,8 @@ end
 
 local function action_stop(state)
   local ref, item = selected_ref(state)
-  if not item or not has_agent(item.task.agent) then return end
-  confirm(state, 'Stop this agent and close its Herdr pane?', 'Stop', function()
+  if not item or not (has_agent(item.task.agent) or has_agent(item.task.conversation)) then return end
+  confirm(state, 'Stop runtime? Conversation history and task status are kept.', 'Stop', function()
     api.stop_agent(ref, item.task.agent, function(_, err)
       if err then return notify(show_error(err)) end
       M.refresh()
@@ -420,7 +628,9 @@ end
 
 local function switch_view(state, scope, repo)
   state.scope, state.repo = scope, repo
+  if scope == 'repo' then state.focus_project = 1 end
   state.selected = nil
+  state.focus_index = 0
   reload_rows(state)
   M.refresh()
 end
@@ -435,42 +645,117 @@ local function action_scope(state)
 end
 
 local function set_cursor(state)
-  if not current(state) or not vim.api.nvim_win_is_valid(state.win) then return end
-  local row = state.card_lines[state.focus_column][state.focus_index] or state.heading_row
-  vim.api.nvim_win_set_cursor(state.win, { row, (state.row_offsets[row] or {})[state.focus_column] or 0 })
+  if current(state) then render(state) end
 end
 
 local function sync_focus(state)
   local item = current_item(state)
   if not item then return end
-  for column, rows in ipairs(state.columns) do
-    for index, row in ipairs(rows) do
-      if row.repo == item.repo and row.task.id == item.task.id then
-        state.focus_column, state.focus_index = column, index
-        return
+  for project_index, project in ipairs(state.project_views or {}) do
+    if project.project.repo == item.repo then
+      for lane_index, lane in ipairs(project.lanes) do
+        for index, row in ipairs(lane.rows) do
+          if row.task.id == item.task.id then
+            state.focus_project = project_index
+            state.lane_focus[item.repo] = lane_index
+            state.focus_index = index
+            return
+          end
+        end
       end
     end
   end
 end
 
-local function move_column(state, delta)
+local function move_lane(state, delta)
   sync_focus(state)
-  state.focus_column = math.max(1, math.min(3, (state.focus_column or 1) + delta))
-  local count = #state.columns[state.focus_column]
-  state.focus_index = count == 0 and 0 or math.min(math.max(state.focus_index or 1, 1), count)
-  local item = state.columns[state.focus_column][state.focus_index]
-  if item then state.selected = ref_key(item.repo, item.task.id) end
+  local project = state.project_views[state.focus_project]
+  if not project then return end
+  local lane_index = state.lane_focus[project.project.repo] or 1
+  lane_index = math.max(1, math.min(#project.lanes, lane_index + delta))
+  state.lane_focus[project.project.repo] = lane_index
+  local rows = project.lanes[lane_index] and project.lanes[lane_index].rows or {}
+  state.focus_index = #rows > 0 and 1 or 0
+  state.selected = rows[1] and ref_key(rows[1].repo, rows[1].task.id) or nil
   set_cursor(state)
 end
 
 local function move_card(state, delta)
   sync_focus(state)
-  local count = #state.columns[state.focus_column]
+  local project = state.project_views[state.focus_project]
+  if not project then return end
+  local lane = project.lanes[state.lane_focus[project.project.repo] or 1]
+  local rows = lane and lane.rows or {}
+  local count = #rows
   if count == 0 then state.focus_index = 0; return set_cursor(state) end
   state.focus_index = math.max(1, math.min(count, (state.focus_index or 1) + delta))
-  local item = state.columns[state.focus_column][state.focus_index]
+  local item = rows[state.focus_index]
   state.selected = ref_key(item.repo, item.task.id)
   set_cursor(state)
+end
+
+local function move_project(state, delta)
+  if state.scope ~= 'global' or #state.project_views == 0 then return end
+  sync_focus(state)
+  local project_index = math.max(1, math.min(#state.project_views, state.focus_project + delta))
+  state.focus_project = project_index
+  local project = state.project_views[project_index]
+  local lane_index = math.max(1, math.min(#project.lanes, state.lane_focus[project.project.repo] or 1))
+  state.lane_focus[project.project.repo] = lane_index
+  local rows = project.lanes[lane_index] and project.lanes[lane_index].rows or {}
+  state.focus_index = #rows > 0 and 1 or 0
+  state.selected = rows[1] and ref_key(rows[1].repo, rows[1].task.id) or nil
+  set_cursor(state)
+end
+
+close_help = function(state)
+  if state.help_win and vim.api.nvim_win_is_valid(state.help_win) then
+    pcall(vim.api.nvim_win_close, state.help_win, true)
+  end
+  state.help_win = nil
+  state.help_buf = nil
+end
+
+local function toggle_help(state)
+  if state.help_win and vim.api.nvim_win_is_valid(state.help_win) then return close_help(state) end
+  local help = {
+    'AgentBoard shortcuts',
+    'n  create task          r  rename task',
+    '+  add lane             R  rename focused lane',
+    'm  move task            d  move to the built-in Done lane',
+    'h/l  previous/next lane  j/k  move between tasks',
+    '[/]  previous/next project in global view',
+    'a  start agent or open linked conversation',
+    'b  link a running agent or saved Claude session',
+    'Enter  attach or resume the linked conversation',
+    'p  send prompt           s  stop runtime',
+    'x  delete task and link  g  switch board scope',
+    'Ctrl-\\ Ctrl-n then q hides the terminal; runtime keeps running',
+    'Starting or resuming an agent keeps the current lane.',
+    'Esc or q closes this help.',
+  }
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, help)
+  vim.bo[buf].buftype = 'nofile'
+  vim.bo[buf].bufhidden = 'wipe'
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = 'agentboard-help'
+  local width = math.max(1, math.min(78, vim.o.columns - 4))
+  local height = math.min(#help, math.max(1, vim.o.lines - 8))
+  state.help_buf = buf
+  state.help_win = vim.api.nvim_open_win(buf, false, {
+    relative = 'editor',
+    row = math.max(0, math.floor((vim.o.lines - height) / 2)),
+    col = math.max(0, math.floor((vim.o.columns - width - 2) / 2)),
+    width = width,
+    height = height,
+    border = 'rounded',
+    title = ' AgentBoard help ',
+    title_pos = 'center',
+    style = 'minimal',
+    focusable = false,
+  })
 end
 
 local function map(state, key, callback)
@@ -481,7 +766,9 @@ end
 
 local function install_mappings(state)
   map(state, 'n', action_create)
+  map(state, '+', action_add_lane)
   map(state, 'r', action_rename)
+  map(state, 'R', action_rename_lane)
   map(state, 'm', action_choose_status)
   map(state, 'd', function(s) action_move(s, 'done') end)
   map(state, 'a', action_start)
@@ -490,16 +777,27 @@ local function install_mappings(state)
   map(state, 'p', action_send)
   map(state, 'x', action_delete)
   map(state, 's', action_stop)
-  map(state, 'h', function(s) move_column(s, -1) end)
-  map(state, 'l', function(s) move_column(s, 1) end)
+  map(state, 'h', function(s) move_lane(s, -1) end)
+  map(state, 'l', function(s) move_lane(s, 1) end)
   map(state, 'j', function(s) move_card(s, 1) end)
   map(state, 'k', function(s) move_card(s, -1) end)
+  map(state, '[', function(s) move_project(s, -1) end)
+  map(state, ']', function(s) move_project(s, 1) end)
   map(state, 'g', action_scope)
-  map(state, 'q', function() M.close() end)
+  map(state, '?', toggle_help)
+  map(state, '<Esc>', function(s) if s.help_win then close_help(s) end end)
+  map(state, 'q', function(s) if s.help_win then close_help(s) else M.close() end end)
 end
 
 local function configure_buffer(state)
   local buf, win = state.buf, state.win
+  vim.api.nvim_set_hl(0, 'AgentBoardTitle', { default = true, link = 'Title' })
+  vim.api.nvim_set_hl(0, 'AgentBoardProject', { default = true, link = 'Directory' })
+  vim.api.nvim_set_hl(0, 'AgentBoardLane', { default = true, link = 'DiagnosticInfo' })
+  vim.api.nvim_set_hl(0, 'AgentBoardCard', { default = true, link = 'Normal' })
+  vim.api.nvim_set_hl(0, 'AgentBoardSelected', { default = true, link = 'Visual' })
+  vim.api.nvim_set_hl(0, 'AgentBoardCursor', { default = true, link = 'Visual' })
+  vim.api.nvim_set_hl(0, 'AgentBoardFooter', { default = true, link = 'Comment' })
   vim.b[buf].agent_board = true
   vim.bo[buf].buftype = 'nofile'
   vim.bo[buf].bufhidden = 'wipe'
@@ -510,6 +808,8 @@ local function configure_buffer(state)
   vim.wo[win].wrap = false
   vim.wo[win].cursorline = true
   vim.wo[win].signcolumn = 'no'
+  vim.wo[win].fillchars = 'eob: '
+  vim.wo[win].winhl = 'CursorLine:AgentBoardCursor'
   install_mappings(state)
 end
 
@@ -543,6 +843,12 @@ local function install_autocmds(state)
       end
     end,
   })
+  vim.api.nvim_create_autocmd({ 'VimResized', 'WinResized' }, {
+    group = state.group,
+    callback = function()
+      if visible(state) then M.refresh() end
+    end,
+  })
 end
 
 function M.refresh()
@@ -559,9 +865,15 @@ function M.refresh()
       state.checked = not err
       state.runtime_error = err ~= nil
       state.agent_states = {}
+      state.native_states = {}
+      state.native_unknown = false
       if not err then
         for _, agent in ipairs(agents) do
           state.agent_states[agent.identity.server .. '\0' .. agent.identity.terminal_id] = agent.state
+          if agent.identity.provider == 'claude' then
+            if require('agent-board.claude').valid_id(agent.identity.session_id) then state.native_states[agent.identity.session_id] = 'running'
+            else state.native_unknown = true end
+          end
         end
       end
       render(state)
@@ -612,7 +924,8 @@ function M.open(opts)
     snapshots = {},
     warnings = {},
     agent_states = {},
-    focus_column = 1,
+    focus_project = 1,
+    lane_focus = {},
     focus_index = 0,
   }
   active = state

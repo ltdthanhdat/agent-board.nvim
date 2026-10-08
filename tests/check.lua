@@ -43,14 +43,66 @@ local function task(title)
 end
 
 local board_path = root .. '/.agent-board.json'
+local default_lanes = {
+  { id = 'todo', name = 'Todo' },
+  { id = 'doing', name = 'Doing' },
+  { id = 'done', name = 'Done' },
+}
 local missing, missing_snapshot = storage.read(board_path, 'board')
-eq(missing, { version = 1, revision = 0, tasks = {} }, 'missing board defaults')
+eq(missing, { version = 3, revision = 0, tasks = {}, lanes = default_lanes }, 'missing board defaults')
 assert(missing_snapshot.data == nil, 'missing file snapshot must be distinguishable')
 
 local board = { version = 1, revision = 1, tasks = { task('Sửa lỗi đăng nhập 🔐') } }
 write(board_path, vim.json.encode(board))
 local loaded, snapshot = storage.read(board_path, 'board')
-eq(loaded, board, 'valid Unicode and null round-trip')
+local normalized = vim.deepcopy(board)
+normalized.version = 3
+normalized.lanes = default_lanes
+normalized.tasks[1].conversation = vim.NIL
+eq(loaded, normalized, 'v1_normalization_no_write')
+assert(read_bytes(board_path) == snapshot.data, 'v1 read must not rewrite bytes')
+local v2 = vim.deepcopy(board)
+v2.version = 2
+v2.tasks[1].conversation = {provider='claude',session_id='12345678-1234-4234-8234-123456789abc',cwd=root}
+write(board_path, vim.json.encode(v2))
+local loaded_v2, v2_snapshot = storage.read(board_path, 'board')
+local normalized_v2 = vim.deepcopy(v2)
+normalized_v2.version = 3
+normalized_v2.lanes = default_lanes
+eq(loaded_v2, normalized_v2, 'v2_normalization_no_write')
+assert(read_bytes(board_path) == v2_snapshot.data, 'v2 read must not rewrite bytes')
+for _, patch in ipairs({{session_id='invalid'},{cwd='relative'},{provider='codex'}}) do
+  local bad=vim.deepcopy(v2)
+  for k,v in pairs(patch) do bad.tasks[1].conversation[k]=v end
+  write(board_path,vim.json.encode(bad))
+  assert(storage.read(board_path,'board')==nil,'invalid conversation rejected')
+end
+
+local custom_v3 = {
+  version = 3,
+  revision = 4,
+  lanes = {
+    { id = 'todo', name = 'Todo' },
+    { id = 'doing', name = 'Doing' },
+    { id = 'done', name = 'Done' },
+    { id = 'review', name = 'Review' },
+  },
+  tasks = { task('Custom lane') },
+}
+custom_v3.tasks[1].status = 'review'
+custom_v3.tasks[1].conversation = vim.NIL
+write(board_path, vim.json.encode(custom_v3))
+eq(storage.read(board_path, 'board'), custom_v3, 'version 3 accepts a custom lane')
+for _, invalid in ipairs({
+  (function() local value = vim.deepcopy(custom_v3); value.lanes[4].id = 'todo'; return value end)(),
+  (function() local value = vim.deepcopy(custom_v3); value.lanes[4].name = 'Todo'; return value end)(),
+  (function() local value = vim.deepcopy(custom_v3); value.tasks[1].status = 'missing'; return value end)(),
+}) do
+  write(board_path, vim.json.encode(invalid))
+  local rejected, lane_error = storage.read(board_path, 'board')
+  assert(rejected == nil and lane_error, 'invalid lane definitions and references are rejected')
+end
+write(board_path,vim.json.encode(board))
 assert(type(snapshot.data) == 'string', 'existing snapshot must preserve raw bytes')
 
 local missing_terminal_id = vim.deepcopy(board)
@@ -72,6 +124,9 @@ eq(empty_registry, { version = 1, revision = 0, repos = {} }, 'missing registry 
 
 local tasks_ok, tasks = pcall(require, 'agent-board.tasks')
 assert(tasks_ok, 'agent-board.tasks is missing')
+for _, name in ipairs({ 'list_lanes', 'add_lane', 'rename_lane' }) do
+  assert(type(tasks[name]) == 'function', 'task lane API is missing: ' .. name)
+end
 storage.registry_path = function()
   return root .. '/isolated-data/agent-board/repos.json'
 end
@@ -106,19 +161,60 @@ assert(tasks.update_task({ repo = repo_a, id = first.id }, { status = 'doing' })
 assert(tasks.update_task({ repo = repo_a, id = first.id }, { agent = {} }) == nil, 'agent cannot bypass link API')
 first = assert(tasks.move_task({ repo = repo_a, id = first.id }, 'doing'))
 eq(tasks.get_task({ repo = repo_a, id = first.id }), first, 'task reload preserves move and rename')
+
+local lanes_a = assert(tasks.list_lanes(repo_a))
+eq(lanes_a, default_lanes, 'new repo uses ordered default lanes')
+local _, _, repo_a_snapshots, repo_a_projects = tasks.list_tasks({ scope = 'repo', repo = repo_a })
+eq(repo_a_projects, { { repo = repo_a, lanes = default_lanes } }, 'repo list includes lane metadata')
+local review_lane = assert(tasks.add_lane(repo_a, '  Review  ', repo_a_snapshots[repo_a]))
+assert(type(review_lane.id) == 'string' and review_lane.id ~= '' and review_lane.id ~= 'todo', 'added lane gets a unique stable ID')
+eq(review_lane.name, 'Review', 'added lane name is trimmed')
+local lanes_after_add = assert(tasks.list_lanes(repo_a))
+eq(lanes_after_add, {
+  { id = 'todo', name = 'Todo' },
+  { id = 'doing', name = 'Doing' },
+  { id = 'done', name = 'Done' },
+  review_lane,
+}, 'added lane is appended')
+local review_created = assert(tasks.create_task({ repo = repo_a, title = 'Review task', status = review_lane.id }))
+eq(review_created.status, review_lane.id, 'task can be created in a configured custom lane')
+first = assert(tasks.move_task({ repo = repo_a, id = first.id }, review_lane.id))
+eq(first.status, review_lane.id, 'task moves to a custom lane')
+local renamed_lane = assert(tasks.rename_lane(repo_a, review_lane.id, 'Verified'))
+eq(renamed_lane, { id = review_lane.id, name = 'Verified' }, 'lane rename preserves lane ID')
+eq(tasks.get_task({ repo = repo_a, id = first.id }).status, review_lane.id, 'renaming a lane keeps tasks attached')
+assert(tasks.add_lane(repo_a, 'Verified') == nil, 'duplicate lane names are rejected')
+assert(tasks.add_lane(repo_a, '   ') == nil, 'empty lane names are rejected')
+assert(tasks.rename_lane(repo_a, 'missing-lane', 'No lane') == nil, 'missing lane rename is rejected')
+assert(tasks.move_task({ repo = repo_a, id = first.id }, 'missing-lane') == nil, 'moving to an unknown lane is rejected')
 local third = assert(tasks.create_task({ repo = repo_b, title = 'Other repo' }))
 assert(third.id ~= first.id and third.id ~= second.id, 'task IDs do not collide across boards')
+eq(third.status, 'todo', 'new task defaults to first configured lane')
+local empty_repo = git_init(root .. '/empty-repo')
+assert(tasks.register_repo(empty_repo))
 
 local repo_tasks = assert(tasks.list_tasks({ scope = 'repo', repo = repo_a }))
-eq(#repo_tasks, 2, 'repo scope includes only its cards')
-local global_tasks, global_warnings, global_snapshots = tasks.list_tasks({ scope = 'global' })
-eq(#global_tasks, 3, 'global scope aggregates registered boards')
+eq(#repo_tasks, 3, 'repo scope includes only its cards')
+local global_tasks, global_warnings, global_snapshots, global_projects = tasks.list_tasks({ scope = 'global' })
+eq(#global_tasks, 4, 'global scope aggregates registered boards')
 eq(global_warnings, {}, 'healthy repos have no warnings')
 local global_repos = {}
 for _, row in ipairs(global_tasks) do
   global_repos[row.repo] = true
 end
 assert(global_repos[repo_a] and global_repos[repo_b], 'global rows identify their source repos')
+local project_paths = {}
+local project_lanes = {}
+for _, project in ipairs(global_projects) do
+  project_paths[#project_paths + 1] = project.repo
+  project_lanes[project.repo] = project.lanes
+end
+local expected_project_paths = { repo_a, repo_b, empty_repo }
+table.sort(expected_project_paths)
+eq(project_paths, expected_project_paths, 'global project metadata preserves registry order and includes empty repos')
+eq(project_lanes[repo_a][4], { id = review_lane.id, name = 'Verified' }, 'each project retains its own lane labels')
+eq(project_lanes[repo_b], default_lanes, 'same lane names remain project-local')
+eq(project_lanes[empty_repo], default_lanes, 'empty project retains default lane metadata')
 
 local external, external_snapshot = storage.read(repo_a .. '/.agent-board.json', 'board')
 external.revision = external.revision + 1
@@ -128,13 +224,15 @@ assert(storage.write_locked(repo_a .. '/.agent-board.json', external, external_s
 release_external()
 local stale_result, stale_error = tasks.move_task({ repo = repo_a, id = first.id }, 'done', global_snapshots[repo_a])
 assert(stale_result == nil and stale_error:find('reload', 1, true), 'stale UI snapshot must require reload')
+local stale_lane, stale_lane_error = tasks.rename_lane(repo_a, review_lane.id, 'Stale rename', global_snapshots[repo_a])
+assert(stale_lane == nil and stale_lane_error:find('reload', 1, true), 'stale lane mutation must require reload')
 eq(tasks.get_task({ repo = repo_a, id = first.id }).title, 'external change', 'stale UI cannot overwrite external edits')
 
 local missing_repo = git_init(root .. '/removed-repo')
 assert(tasks.register_repo(missing_repo))
 assert(vim.fn.delete(missing_repo, 'rf') == 0)
 local surviving_tasks, missing_warnings = tasks.list_tasks({ scope = 'global' })
-eq(#surviving_tasks, 3, 'unavailable repo does not hide healthy boards')
+eq(#surviving_tasks, 4, 'unavailable repo does not hide healthy boards')
 assert(#missing_warnings == 1 and missing_warnings[1].repo == missing_repo, 'unavailable repo is reported')
 
 local broken_repo = git_init(root .. '/broken-repo')
@@ -285,7 +383,7 @@ local sent, send_error = await(function(cb) herdr.send(identity, message, cb) en
 assert(sent and not send_error)
 eq(requests[#requests], { 'agent', 'prompt', 'w1:p1', message }, 'prompt uses argv and does not wait for the turn')
 
-eq(herdr.attach_argv(identity), { 'herdr', 'agent', 'attach', 'w1:p1' }, 'attach targets the exact pane')
+eq(herdr.attach_argv(identity), { 'herdr', 'terminal', 'attach', 'term_1234' }, 'attach targets the exact terminal')
 responses[#responses + 1] = result({ type = 'agent_info', agent = agent_info() })
 responses[#responses + 1] = result({ type = 'pane_closed' })
 local stopped, stop_error = await(function(cb) herdr.stop(identity, cb) end)
@@ -329,12 +427,29 @@ assert(second_start.identity.terminal_id == 'term_second')
 eq(#requests, previous_request_count + 3, 'existing workspace skips workspace creation')
 eq(requests[previous_request_count + 2], { 'tab', 'create', '--cwd', start_repo, '--no-focus', '--workspace', 'w-agent', '--label', 'ab-second' }, 'existing workspace starts in the owned workspace')
 
+local native_id='12345678-1234-4234-8234-123456789abc'
+local function native_start(mode, reported)
+  responses[#responses+1]=result({workspaces={{workspace_id='w-agent',label='agent-board.nvim'}}})
+  responses[#responses+1]=result({tab={tab_id='w-agent:t3'},root_pane={pane_id='w-agent:p3'}})
+  responses[#responses+1]=result({agent=agent_info({agent='claude',name='ab-native',pane_id='w-agent:p3',agent_session=reported and {source='herdr:claude',agent='claude',kind='id',value=reported} or vim.NIL})})
+  return await(function(cb) herdr.start(start_repo,'claude','ab-native',cb,{agent_args={mode,native_id},expected_session_id=native_id}) end)
+end
+local native=native_start('--session-id',native_id)
+assert(native and native.identity.session_id==native_id)
+eq(requests[#requests],{'agent','start','ab-native','--kind','claude','--pane','w-agent:p3','--timeout','30000','--','--session-id',native_id},'explicit new UUID argv')
+assert(native_start('--resume',native_id))
+assert(requests[#requests][11]=='--resume','resume exact UUID argv')
+local unverified,unverified_error=native_start('--resume',nil)
+assert(not unverified and unverified_error.code=='session_identity_unverified' and unverified_error.host and unverified_error.agent,'missing native evidence includes recovery')
+local mismatched,mismatch=native_start('--resume','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+assert(not mismatched and mismatch.code=='identity_mismatch' and mismatch.agent,'wrong native UUID rejected')
+
 vim.env.HERDR_SOCKET_PATH = previous_socket
 
 write(board_path, '{broken json')
 local malformed, malformed_err = storage.read(board_path, 'board')
 assert(malformed == nil and malformed_err, 'malformed JSON must be rejected')
-write(board_path, vim.json.encode({ version = 2, revision = 1, tasks = {} }))
+write(board_path, vim.json.encode({ version = 4, revision = 1, tasks = {} }))
 local unsupported, unsupported_err = storage.read(board_path, 'board')
 assert(unsupported == nil and unsupported_err, 'unsupported version must be rejected')
 
@@ -350,6 +465,9 @@ local next_snapshot = assert(storage.write_locked(board_path, current, current_s
 release()
 eq(storage.read(board_path, 'board'), current, 'successful write is visible')
 assert(next_snapshot.revision == 2, 'write increments document revision')
+assert(vim.json.decode(read_bytes(board_path)).version==3,'migration_on_mutation')
+assert(storage.read(registry_path,'registry').version==1,'registry_stays_v1')
+assert(current.tasks[1].agent.provider=='codex' and current.tasks[1].conversation==vim.NIL,'legacy_provider_preservation')
 
 local stale = { version = 1, revision = 2, tasks = { task('stale write') } }
 local bytes_before = read_bytes(board_path)
@@ -371,6 +489,9 @@ release_after_error()
 
 local function check_lifecycle_and_board()
 local api = require('agent-board')
+for _, name in ipairs({ 'list_lanes', 'add_lane', 'rename_lane' }) do
+  assert(type(api[name]) == 'function', 'public lane API is missing: ' .. name)
+end
 for _, name in ipairs({ 'start_agent', 'bind_agent', 'open_agent', 'hide_agent', 'send', 'stop_agent' }) do
   assert(type(api[name]) == 'function', 'public lifecycle API is missing: ' .. name)
 end
@@ -382,6 +503,7 @@ local task4_registry_path = root .. '/task4-data/agent-board/repos.json'
 storage.registry_path = function() return task4_registry_path end
 local task4_repo_a = git_init(root .. '/task4-repo-a')
 local task4_repo_b = git_init(root .. '/task4-repo-b')
+local task4_lane = assert(api.add_lane(task4_repo_a, 'Review'))
 local function make_task(repo, title)
   return assert(tasks.create_task({ repo = repo, title = title }))
 end
@@ -395,6 +517,9 @@ local rename_task = make_task(task4_repo_a, 'Rename target')
 local delete_task = make_task(task4_repo_a, 'Delete target')
 local concurrent_a = make_task(task4_repo_a, 'Concurrent A')
 local concurrent_b = make_task(task4_repo_a, 'Concurrent B')
+for _, item in ipairs({ failed_start_task, started_task, save_failed_task }) do
+  assert(api.move_task({ repo = task4_repo_a, id = item.id }, task4_lane.id))
+end
 
 vim.env.HERDR_SOCKET_PATH = root .. '/task4.sock'
 local task4_server = 'socket:' .. root .. '/task4.sock'
@@ -487,7 +612,7 @@ local failed_start, failed_start_error = await(function(callback)
   api.start_agent({ repo = task4_repo_a, id = failed_start_task.id }, { provider = 'codex' }, callback)
 end)
 assert(failed_start == nil and failed_start_error, 'failed Herdr start reports an error')
-eq(tasks.get_task({ repo = task4_repo_a, id = failed_start_task.id }).status, 'todo', 'failed start leaves status unchanged')
+eq(tasks.get_task({ repo = task4_repo_a, id = failed_start_task.id }).status, task4_lane.id, 'failed start leaves the custom lane unchanged')
 eq(tasks.get_task({ repo = task4_repo_a, id = failed_start_task.id }).agent, vim.NIL, 'failed start leaves link empty')
 
 start_failure = nil
@@ -496,7 +621,7 @@ local started_task_value, started_error = await(function(callback)
   api.start_agent({ repo = task4_repo_a, id = started_task.id }, { provider = 'codex' }, callback)
 end)
 assert(started_task_value and not started_error)
-eq(started_task_value.status, 'doing', 'successful start and Doing status are saved together')
+eq(started_task_value.status, task4_lane.id, 'successful start preserves the selected custom lane')
 assert(started_task_value.agent.terminal_id and starts == start_count_before + 1, 'successful start persists returned terminal identity')
 
 local opened_existing = 0
@@ -536,7 +661,7 @@ end)
 storage.write_locked = saved_write_locked
 assert(save_failed == nil and save_error and save_error.agent and save_error.agent.terminal_id, 'save failure returns the started agent identity')
 eq(stops, stops_before_save_failure, 'save failure never stops a started agent')
-eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).status, 'todo', 'save failure does not claim Doing was persisted')
+eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).status, task4_lane.id, 'save failure preserves the selected custom lane')
 eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).agent.terminal_id, offline_identity.terminal_id, 'save failure preserves the previously persisted offline link')
 local recovered, recovery_error = await(function(callback)
   api.bind_agent({ repo = task4_repo_a, id = save_failed_task.id }, save_error.agent, callback)
@@ -648,7 +773,7 @@ end
 local terminal_key = 'task4-terminal-key'
 local first_terminal_identity = identity_for('term-terminal-1', 'task4:terminal-1', 'terminal-one', 'session-one')
 local first_entry = assert(terminal.open(terminal_key, first_terminal_identity))
-eq(fake_jobs[1], { 'herdr', 'agent', 'attach', first_terminal_identity.pane_id }, 'terminal attaches using argv')
+eq(fake_jobs[1], { 'herdr', 'terminal', 'attach', first_terminal_identity.terminal_id }, 'terminal attaches using argv')
 local normal_maps = vim.api.nvim_buf_get_keymap(first_entry.buf, 'n')
 local has_hide_key = false
 for _, map in ipairs(normal_maps) do

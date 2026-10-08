@@ -1,3 +1,0 @@
-live fixture marker: yes
-pane close log: absent
-attach process count: 1

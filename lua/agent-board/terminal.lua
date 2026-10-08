@@ -39,7 +39,15 @@ local function cleanup(key, entry)
   if entries[key] == entry then entries[key] = nil end
 end
 
-local function open_float(buf)
+local function has_controller_conflict(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return false end
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  local output = table.concat(vim.api.nvim_buf_get_lines(buf, math.max(0, line_count - 100), line_count, false), ''):gsub('%s+', '')
+  return output:find('alreadyhasanattachedclient', 1, true) ~= nil
+end
+
+local function open_float(buf, opts)
+  opts = opts or {}
   local width = math.max(1, math.min(vim.o.columns - 2, math.floor(vim.o.columns * 0.85)))
   local height = math.max(1, math.min(vim.o.lines - 2, math.floor(vim.o.lines * 0.80)))
   return vim.api.nvim_open_win(buf, true, {
@@ -50,6 +58,10 @@ local function open_float(buf)
     row = math.max(0, math.floor((vim.o.lines - height) / 2)),
     style = 'minimal',
     border = 'rounded',
+    title = ' ' .. (opts.label or 'Agent terminal') .. ' ',
+    title_pos = 'center',
+    footer = ' Ctrl-\\ Ctrl-n · q hide ',
+    footer_pos = 'center',
   })
 end
 
@@ -57,16 +69,23 @@ local function focus(entry)
   if entry.win and vim.api.nvim_win_is_valid(entry.win) then
     vim.api.nvim_set_current_win(entry.win)
   else
-    entry.win = open_float(entry.buf)
+    entry.win = open_float(entry.buf, entry.opts)
   end
   vim.cmd('startinsert')
 end
 
-function M.open(key, identity)
+function M.open(key, identity, opts)
+  opts = opts or {}
+  local owner = opts.tabpage or vim.api.nvim_get_current_tabpage()
+  if not vim.api.nvim_tabpage_is_valid(owner) or vim.api.nvim_get_current_tabpage() ~= owner then
+    return nil, {code='owner_unavailable',message='Return to the board tab and open the agent again'}
+  end
   local argv, argv_error = herdr.attach_argv(identity)
   if not argv then return nil, argv_error end
   local current = entries[key]
   if current and same_identity(current.identity, identity) and M.job_running(current.job) then
+    current.opts = opts
+    if current.win and vim.api.nvim_win_is_valid(current.win) and vim.api.nvim_win_get_tabpage(current.win) ~= owner then close_window(current) end
     focus(current)
     return current
   end
@@ -74,8 +93,8 @@ function M.open(key, identity)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = 'hide'
   vim.bo[buf].swapfile = false
-  local entry = { buf = buf, identity = vim.deepcopy(identity) }
-  local ok, win = pcall(open_float, buf)
+  local entry = { buf = buf, identity = vim.deepcopy(identity), opts = opts }
+  local ok, win = pcall(open_float, buf, opts)
   if not ok then
     pcall(vim.api.nvim_buf_delete, buf, { force = true })
     return nil, { code = 'terminal_error', message = tostring(win) }
@@ -95,7 +114,14 @@ function M.open(key, identity)
   vim.keymap.set('n', 'q', function() M.hide(key) end, { buffer = buf, silent = true, nowait = true })
   local started, job = pcall(M.spawn_term, argv, function(job_id, code, event)
     vim.schedule(function()
+      local was_current = entries[key] == entry
+      local controller_conflict = was_current and has_controller_conflict(entry.buf)
       cleanup(key, entry)
+      if controller_conflict then
+        vim.notify('agent-board: Herdr terminal already has an attached client. Close the other controller and reopen; the agent is still running.', vim.log.levels.WARN)
+      elseif code ~= 0 and was_current then
+        vim.notify('agent-board: Herdr attach failed (exit ' .. tostring(code) .. '). Check the terminal controller and reopen; the agent runtime is kept.', vim.log.levels.WARN)
+      end
     end)
   end)
   if not started or type(job) ~= 'number' or job <= 0 then
