@@ -26,9 +26,9 @@ assert(tasks.register_repo(repo_b))
 local herdr = require('agent-board.herdr')
 local terminal = require('agent-board.terminal')
 local server = herdr.server_key()
-local live_agents, starts, prompts, stops = {}, 0, {}, 0
+local live_agents, starts, prompts, stops, start_options = {}, 0, {}, 0, {}
 local function identity(pane, terminal_id, name)
-  return { provider = 'codex', runtime = 'herdr', server = server, pane_id = pane, terminal_id = terminal_id, name = name, session_id = 'session-' .. pane }
+  return { provider = 'codex', runtime = 'herdr', server = server, pane_id = pane, terminal_id = terminal_id, name = name, session_id = 'session-' .. pane:gsub('[^%w._%-]', '-') }
 end
 local function live(agent_identity, cwd)
   return { identity = vim.deepcopy(agent_identity), cwd = cwd or repo_a, state = 'working' }
@@ -45,10 +45,12 @@ herdr.resolve = function(agent_identity, callback)
   local item = live_agents[agent_identity.pane_id]
   if item then callback(vim.deepcopy(item)) else callback(nil, { code = 'offline', message = 'agent is offline' }) end
 end
-herdr.start = function(repo, provider, name, callback)
+herdr.start = function(repo, provider, name, callback, opts)
   starts = starts + 1
+  start_options[starts] = opts and vim.deepcopy(opts) or nil
   local agent_identity = identity('started:pane:' .. starts, 'term-started-' .. starts, name)
   agent_identity.provider = provider
+  if opts and opts.expected_session_id then agent_identity.session_id = opts.expected_session_id end
   local item = live(agent_identity, repo)
   live_agents[agent_identity.pane_id] = item
   callback({ identity = vim.deepcopy(agent_identity), host = { workspace_id = 'ui-workspace', tab_id = 'ui-tab', pane_id = agent_identity.pane_id } })
@@ -147,6 +149,15 @@ local function accept_picker(index)
   press('<CR>')
 end
 
+local function accept_named_session(title)
+  local list_win = assert(picker_windows())
+  local picker_lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(list_win), 0, -1, false)
+  for index, line in ipairs(picker_lines) do
+    if line:find(title, 1, true) then return accept_picker(index) end
+  end
+  error('session not found in picker: ' .. title)
+end
+
 local function task_from(repo, id)
   return assert(tasks.get_task({ repo = repo, id = id }))
 end
@@ -215,14 +226,35 @@ input_responses[#input_responses + 1] = 'Agent task'
 press('n')
 local repo_rows = assert(tasks.list_tasks({ scope = 'repo', repo = repo_a }))
 local agent_task_id = repo_rows[#repo_rows].task.id
+select_responses[#select_responses + 1] = function() return nil end
+press('<CR>')
+eq(starts, 0, 'canceling the Enter provider picker must not launch an agent')
+eq(task_from(repo_a, agent_task_id).agent, vim.NIL, 'canceling the provider picker keeps the task unlinked')
 select_responses[#select_responses + 1] = choose('codex')
-press('a')
+press('<CR>')
+assert(vim.wait(10000, function() return terminal.is_open(table.concat({ repo_a, agent_task_id, 'herdr' }, '\0')) end), 'Enter must create and enter the new session in one action')
 local started_task = task_from(repo_a, agent_task_id)
 eq(started_task.status, 'todo', 'starting an agent keeps the task in its current lane')
 assert(started_task.agent ~= vim.NIL and starts == 1)
+press('<Esc>')
+press('q')
+select_responses[#select_responses + 1] = function(items, opts)
+  local labels = {}
+  for _, action in ipairs(items) do labels[#labels + 1] = opts.format_item(action) end
+  local text = table.concat(labels, '\n')
+  contains(text, 'Open / resume session')
+  contains(text, 'Send prompt')
+  contains(text, 'Stop runtime')
+  assert(not text:find('Start session', 1, true), 'linked task must not offer a second session start')
+  return nil
+end
+press(' ')
+
+local starts_before_open = starts
 
 press('<CR>')
-assert(terminal.is_open(table.concat({ repo_a, agent_task_id, 'herdr' }, '\0')))
+assert(vim.wait(10000, function() return terminal.is_open(table.concat({ repo_a, agent_task_id, 'herdr' }, '\0')) end))
+eq(starts, starts_before_open, 'Enter on a linked task opens its session without starting another agent')
 local float_win=vim.api.nvim_get_current_win()
 local float_config=vim.api.nvim_win_get_config(float_win)
 assert(float_config.relative=='editor' and float_config.title and float_config.footer,'float label and hide hint')
@@ -231,10 +263,12 @@ press('<Esc>')
 press('q')
 assert(not terminal.is_open(table.concat({ repo_a, agent_task_id, 'herdr' }, '\0')), 'q hides the floating terminal')
 press('<CR>')
+assert(vim.wait(10000, function() return terminal.is_open(table.concat({ repo_a, agent_task_id, 'herdr' }, '\0')) end))
 eq(spawn_count, 1, 'reopen reuses the attach client')
 press('<Esc>')
 press('q')
 press('<CR>')
+assert(vim.wait(10000, function() return terminal.is_open(table.concat({ repo_a, agent_task_id, 'herdr' }, '\0')) end))
 local conflict_buf=vim.api.nvim_get_current_buf()
 vim.api.nvim_buf_set_lines(conflict_buf,0,-1,false,{'{"type":"terminal.closed","reason":"terminal attach failed: terminal term-existing already has an attached client; retry with --takeover"}'})
 local conflict_notifications={}
@@ -251,17 +285,22 @@ api.send = function(ref, message, expected_agent, callback)
   return regular_send(ref, message, expected_agent, callback)
 end
 input_responses[#input_responses + 1] = 'Reply with only OK'
-press('p')
+select_responses[#select_responses + 1] = function(items, opts)
+  for _, action in ipairs(items) do if opts.format_item(action) == 'Send prompt' then return action end end
+  error('send prompt action is missing')
+end
+press(' ')
 api.send = regular_send
 eq(selected_send_identity, started_task.agent, 'send is bound to the agent shown when its prompt opened')
-eq(prompts[#prompts], { pane_id = started_task.agent.pane_id, message = 'Reply with only OK' }, 'p sends the entered prompt')
+assert(vim.wait(10000, function() return #prompts > 0 end), 'send prompt reaches the linked agent')
+eq(prompts[#prompts], { pane_id = started_task.agent.pane_id, message = 'Reply with only OK' }, 'Space action sends the entered prompt')
 
 select_responses[#select_responses + 1] = function() return nil end
-press('x')
+press('<Delete>')
 assert(task_from(repo_a, agent_task_id), 'canceling delete keeps the linked task')
 eq(stops, 0, 'canceling delete does not stop the agent')
 select_responses[#select_responses + 1] = choose('Delete')
-press('x')
+press('<Delete>')
 assert(not tasks.get_task({ repo = repo_a, id = agent_task_id }), 'deleting a task removes its persisted card')
 eq(stops, 0, 'deleting a linked task does not stop its agent')
 
@@ -271,7 +310,7 @@ local bind_rows = assert(tasks.list_tasks({ scope = 'repo', repo = repo_a }))
 local bind_task_id = bind_rows[#bind_rows].task.id
 press('b')
 assert(wait_for_picker(), 'live session picker timeout')
-accept_picker(1)
+accept_named_session('existing-agent')
 assert(vim.wait(10000,function() return task_from(repo_a,bind_task_id).agent~=vim.NIL end),'live picker bind timeout')
 local bound_task = task_from(repo_a, bind_task_id)
 eq(bound_task.agent.terminal_id, existing_identity.terminal_id, 'b links the selected existing agent')
@@ -284,7 +323,7 @@ local saved_notify, notifications = vim.notify, {}
 vim.notify = function(message) notifications[#notifications + 1] = tostring(message) end
 press('b')
 assert(wait_for_picker(), 'duplicate session picker timeout')
-accept_picker(1)
+accept_named_session('existing-agent')
 assert(vim.wait(10000,function() return #notifications>0 end),'duplicate warning timeout')
 vim.notify = saved_notify
 eq(task_from(repo_a, duplicate_bind_id).agent, vim.NIL, 'binding an already-linked agent leaves the second task unlinked')
@@ -322,6 +361,7 @@ api.stop_agent = function(ref, expected_agent, callback)
 end
 press('s')
 api.stop_agent = regular_stop_agent
+assert(vim.wait(10000, function() return stops == 1 end), 'confirmed stop reaches Herdr')
 eq(selected_stop_identity, bound_task.agent, 'stop is bound to the agent shown when its confirmation opened')
 eq(task_from(repo_a, bind_task_id).status, 'todo', 'confirmed stop does not change task status')
 eq(task_from(repo_a, bind_task_id).agent.terminal_id, existing_identity.terminal_id, 'stop keeps the persisted link')
@@ -339,7 +379,7 @@ eq(row_ids(repo_a), saved_ids, 'reopening the board preserves task IDs and order
 eq(task_from(repo_a, bind_task_id).agent.terminal_id, existing_identity.terminal_id, 'reopening preserves the stopped task link')
 
 select_responses[#select_responses + 1] = choose('Delete')
-press('x')
+press('<Delete>')
 assert(not tasks.get_task({ repo = repo_a, id = bind_task_id }))
 eq(stops, 1, 'deleting after stop does not stop the agent a second time')
 
@@ -450,10 +490,10 @@ local added_lanes = assert(api.list_lanes(repo_a))
 local added_lane = added_lanes[#added_lanes]
 eq(added_lane.name, 'Build', '+ adds a lane to the focused project')
 input_responses[#input_responses + 1] = 'Verify'
-press('R')
+press('r')
 local renamed_lanes = assert(api.list_lanes(repo_a))
 eq(renamed_lanes[#renamed_lanes].id, added_lane.id, 'lane rename preserves its stable ID')
-eq(renamed_lanes[#renamed_lanes].name, 'Verify', 'R renames the focused lane')
+eq(renamed_lanes[#renamed_lanes].name, 'Verify', 'r renames the focused lane when no task is selected')
 press('h')
 contains(lines(board_buf), 'Review (1)')
 board.refresh()
@@ -560,15 +600,26 @@ assert(vim.wait(10000,function() return task_from(repo_a,offline_id).conversatio
 eq(starts,before_bind_starts,'picker binds without launching')
 board.refresh();vim.wait(50)
 contains(lines(board_buf),'claude · offline')
-local real_open=api.open_agent
-local open_requests=0
-api.open_agent=function(ref,expected_agent,cb,opts)
-  if type(expected_agent)=='function' then cb=expected_agent end
-  open_requests=open_requests+1;assert(ref.id==offline_id);cb(true)
+local real_terminal_open=terminal.open
+local resumed_open
+terminal.open=function(key,agent_identity,opts)
+ resumed_open={key=key,identity=vim.deepcopy(agent_identity),opts=opts}
+ return true
 end
-press('<CR>');press('a')
-eq(open_requests,2,'Enter and a open the linked conversation')
-api.open_agent=real_open
+press('<CR>')
+assert(vim.wait(10000,function() return resumed_open~=nil end),'Enter resumes the offline linked session')
+terminal.open=real_terminal_open
+eq(starts,before_bind_starts+1,'Enter starts exactly one runtime to resume the offline session')
+eq(resumed_open.identity.session_id,native_id,'Enter opens the original native Claude session')
+eq(start_options[starts].expected_session_id,native_id,'resume start verifies the saved Claude UUID')
+eq(start_options[starts].agent_args,{'--resume',native_id},'resume start passes the existing transcript ID')
+eq(task_from(repo_a,offline_id).agent.session_id,native_id,'resumed runtime is saved on the task')
+local saved_input, create_cancel = vim.ui.input, nil
+vim.ui.input = function(_, callback) create_cancel = callback end
+press('a')
+assert(create_cancel, 'a creates a task instead of opening the linked session')
+create_cancel(nil)
+vim.ui.input = saved_input
 local help_select = vim.ui.select
 vim.ui.select = function() error('help must not open a selector') end
 press('?')

@@ -34,7 +34,7 @@ local function ordered_messages(preview)
 end
 
 local function preview_lines(item)
-  local provider=item.conversation and 'Claude session' or
+  local provider=item.conversation and (item.conversation.provider or 'Agent')..' session' or
     (item.agent and item.agent.identity and (item.agent.identity.provider or 'Agent')..' session' or 'Session')
   local lines={item.title or 'Untitled session',provider..' · '..(item.state or 'unknown')}
   if item.updated_at then lines[#lines+1]='Updated · '..item.updated_at end

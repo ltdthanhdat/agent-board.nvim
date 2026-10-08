@@ -113,10 +113,14 @@ local function validate(document, kind)
       end
       local conversation = task.conversation
       if conversation ~= nil and conversation ~= vim.NIL then
-        if type(conversation) ~= 'table' or conversation.provider ~= 'claude'
-          or not require('agent-board.claude').valid_id(conversation.session_id)
+        local supported_provider = type(conversation) == 'table'
+          and (conversation.provider == 'claude' or conversation.provider == 'codex' or conversation.provider == 'pi')
+        local valid_session_id = supported_provider and type(conversation.session_id) == 'string'
+          and (conversation.provider == 'claude' and require('agent-board.claude').valid_id(conversation.session_id)
+            or conversation.provider ~= 'claude' and conversation.session_id:match('^[%w][%w._%-]*$') ~= nil)
+        if not supported_provider or not valid_session_id
           or type(conversation.cwd) ~= 'string' or conversation.cwd:sub(1,1) ~= '/' then
-          return false, 'conversation needs a Claude UUID and absolute cwd'
+          return false, 'conversation needs a provider session ID and absolute cwd'
         end
       end
       local agent_ok, agent_error = validate_agent(task.agent)

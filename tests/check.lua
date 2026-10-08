@@ -11,6 +11,9 @@ end
 
 local root = vim.fn.tempname() .. '-agent-board'
 assert(vim.fn.mkdir(root, 'p') == 1)
+vim.env.CODEX_HOME = root .. '/codex'
+vim.env.CLAUDE_CONFIG_DIR = root .. '/claude'
+vim.env.PI_CODING_AGENT_DIR = root .. '/pi'
 
 local function write(path, value)
   local file = assert(io.open(path, 'wb'))
@@ -71,7 +74,7 @@ normalized_v2.version = 3
 normalized_v2.lanes = default_lanes
 eq(loaded_v2, normalized_v2, 'v2_normalization_no_write')
 assert(read_bytes(board_path) == v2_snapshot.data, 'v2 read must not rewrite bytes')
-for _, patch in ipairs({{session_id='invalid'},{cwd='relative'},{provider='codex'}}) do
+for _, patch in ipairs({{session_id='invalid'},{cwd='relative'},{provider='unknown'}}) do
   local bad=vim.deepcopy(v2)
   for k,v in pairs(patch) do bad.tasks[1].conversation[k]=v end
   write(board_path,vim.json.encode(bad))
@@ -556,12 +559,19 @@ herdr.resolve = function(identity, callback)
   callback(live)
 end
 
-herdr.start = function(repo, provider, name, callback)
+herdr.list = function(callback)
+  local agents = {}
+  for _, live in pairs(live_agents) do agents[#agents + 1] = vim.deepcopy(live) end
+  callback(agents)
+end
+
+herdr.start = function(repo, provider, name, callback, opts)
   starts = starts + 1
   if start_failure then
     return callback(nil, vim.deepcopy(start_failure))
   end
-  local identity = identity_for('term-start-' .. starts, 'task4:p' .. starts, name, 'session-start-' .. starts)
+  local identity = identity_for('term-start-' .. starts, 'task4:p' .. starts, name,
+    opts and opts.expected_session_id or 'session-start-' .. starts)
   identity.provider = provider
   local live = { identity = identity, cwd = repo, state = 'idle' }
   live_agents[identity.pane_id] = live
@@ -641,6 +651,11 @@ eq(opened_existing, 1, 'an already-live link opens its existing terminal')
 terminal.open = original_terminal_open
 
 local offline_identity = identity_for('term-offline-save-failure', 'task4:offline-save-failure', 'old-agent', 'session-old')
+local codex_history = root .. '/codex/sessions/2026/10/08'
+assert(vim.fn.mkdir(codex_history, 'p') == 1)
+write(codex_history .. '/offline-fixture.jsonl', vim.json.encode({
+  type = 'session_meta', payload = { id = 'session-old', cwd = task4_repo_a, timestamp = '2026-10-08T00:00:00Z' },
+}) .. '\n')
 live_agents[offline_identity.pane_id] = live_for(offline_identity)
 assert(await(function(callback)
   api.bind_agent({ repo = task4_repo_a, id = save_failed_task.id }, offline_identity, callback)
@@ -648,9 +663,11 @@ end))
 live_agents[offline_identity.pane_id] = nil
 
 local saved_write_locked = storage.write_locked
+local failed_writes = 0
 storage.write_locked = function(path, document, snapshot)
   if path == task4_repo_a .. '/.agent-board.json' then
-    return nil, 'simulated disk failure'
+    failed_writes = failed_writes + 1
+    if failed_writes == 2 then return nil, 'simulated disk failure' end
   end
   return saved_write_locked(path, document, snapshot)
 end
@@ -664,10 +681,11 @@ eq(stops, stops_before_save_failure, 'save failure never stops a started agent')
 eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).status, task4_lane.id, 'save failure preserves the selected custom lane')
 eq(tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).agent.terminal_id, offline_identity.terminal_id, 'save failure preserves the previously persisted offline link')
 local recovered, recovery_error = await(function(callback)
-  api.bind_agent({ repo = task4_repo_a, id = save_failed_task.id }, save_error.agent, callback)
+  api.open_agent({ repo = task4_repo_a, id = save_failed_task.id }, callback)
 end)
-assert(recovered and not recovery_error, 'a verified running replacement can recover a failed replacement save')
-eq(recovered.agent.terminal_id, save_error.agent.terminal_id, 'recovery links the new running agent')
+assert(recovered and not recovery_error, 'the exact resumed session can recover a failed replacement save')
+eq(recovered.identity.terminal_id, save_error.agent.terminal_id, 'recovery links the new running agent')
+assert(not tasks.get_task({ repo = task4_repo_a, id = save_failed_task.id }).pending_start, 'recovery clears the pending start marker')
 
 local stop_identity = identity_for('term-stop', 'task4:stop', 'stop-agent', 'session-stop')
 live_agents[stop_identity.pane_id] = live_for(stop_identity)

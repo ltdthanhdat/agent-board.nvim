@@ -564,6 +564,13 @@ end
 
 local unique_conversation
 
+local function same_conversation(left, right)
+  return linked(left) and linked(right)
+    and left.provider == right.provider and left.session_id == right.session_id
+end
+
+local open_provider_session
+
 function M.bind_agent(ref, identity, expected_snapshot, callback)
   if type(expected_snapshot) == 'function' then
     callback, expected_snapshot = expected_snapshot, nil
@@ -596,6 +603,7 @@ function M.bind_agent(ref, identity, expected_snapshot, callback)
         tx.task.conversation = vim.deepcopy(conversation)
       end
       tx.task.agent = stored_identity(live.identity)
+      tx.task.pending_start = nil
       local saved, save_error = tx.commit()
       tx.release()
       if not saved then return done(nil, runtime_failure('save_failed', tostring(save_error))) end
@@ -605,12 +613,16 @@ function M.bind_agent(ref, identity, expected_snapshot, callback)
     if live.identity.provider == 'claude' and claude.valid_id(live.identity.session_id) then
       return require('agent-board.sessions').list(tx.root,guarded(tx,done,function(discovery)
         for _,row in ipairs(discovery.sessions) do
-          if row.conversation and row.conversation.session_id==live.identity.session_id and row.agent
+          if row.conversation and row.conversation.provider == 'claude'
+            and row.conversation.session_id==live.identity.session_id and row.agent
             and row.agent.identity.terminal_id==live.identity.terminal_id then return save_binding(row.conversation) end
         end
         tx.release()
         done(nil,runtime_failure('session_identity_unverified','Herdr could not verify the live Claude session in this repository',{agent=live.identity}))
       end))
+    end
+    if live.identity.session_id then
+      return save_binding({ provider = live.identity.provider, session_id = live.identity.session_id, cwd = live.cwd })
     end
     save_binding()
   end)
@@ -690,7 +702,20 @@ end
 
 function M.start_agent(ref, opts, callback)
   local existing = M.get_task(ref)
-  if existing and linked(existing.conversation) then return M.open_conversation(ref, callback, opts and opts.terminal_opts, false) end
+  if existing and linked(existing.conversation) then
+    if existing.conversation.provider == 'claude' then return M.open_conversation(ref, callback, opts and opts.terminal_opts, false) end
+    return M.open_agent(ref, function(live, err)
+      if not live then return callback(nil, err) end
+      local task, task_error = M.get_task(ref)
+      if not task then return callback(nil, runtime_failure('task_not_found', task_error)) end
+      task.existing = true
+      task.terminal_opened = true
+      callback(task)
+    end, opts and opts.terminal_opts)
+  end
+  if existing and linked(existing.agent) and existing.agent.provider ~= 'claude' then
+    return M.open_agent(ref, existing.agent, callback, opts and opts.terminal_opts)
+  end
   if opts and opts.provider == 'claude' and existing and not linked(existing.agent) then return M.new_conversation(ref, opts, callback) end
   if opts and opts.provider=='claude' and existing and linked(existing.agent) and existing.agent.provider=='claude' then
     return promote_legacy_conversation(ref,existing,function(promoted,err)
@@ -728,6 +753,9 @@ function M.start_agent(ref, opts, callback)
         return done(nil, unique_error)
       end
       tx.task.agent = identity
+      if opts.provider ~= 'claude' and type(identity.session_id) == 'string' and identity.session_id ~= '' then
+        tx.task.conversation = { provider = opts.provider, session_id = identity.session_id, cwd = tx.root }
+      end
       local saved, save_error = tx.commit()
       tx.release()
       if not saved then
@@ -773,6 +801,109 @@ local function get_linked_identity(ref, expected_agent)
   return task, runtime_identity(task.agent)
 end
 
+local function provider_resume_args(provider, session_id)
+  if provider == 'codex' then return { 'resume', session_id } end
+  if provider == 'pi' then return { '--session', session_id } end
+end
+
+open_provider_session = function(ref, callback, opts)
+  if type(callback) ~= 'function' then return nil, 'a callback is required' end
+  local done = callback_once(callback)
+  opts = opts or { tabpage = vim.api.nvim_get_current_tabpage() }
+  local current, task_error = M.get_task(ref)
+  if not current or not linked(current.conversation) then
+    return done(nil, runtime_failure('no_agent', task_error or 'task has no saved provider session'))
+  end
+  local conversation = vim.deepcopy(current.conversation)
+  local provider, session_id = conversation.provider, conversation.session_id
+  local agent_args = provider_resume_args(provider, session_id)
+  if not agent_args then return done(nil, runtime_failure('unavailable', 'unsupported provider session')) end
+  local sessions = require('agent-board.sessions')
+  local function discover()
+    sessions.resolve(conversation, function(session, resolve_error)
+      if not session then return done(nil, resolve_error) end
+      local tx, tx_error = begin_transaction(ref)
+      if not tx then return done(nil, tx_error) end
+      if not same_conversation(tx.task.conversation, conversation)
+        or tx.task.conversation.cwd ~= conversation.cwd then
+        tx.release()
+        return done(nil, runtime_failure('conflict', 'task session changed; reload before opening'))
+      end
+      local unique, unique_error = unique_conversation(tx, conversation)
+      if not unique then tx.release();return done(nil, unique_error) end
+      sessions.resolve(conversation, guarded(tx, done, function(verified, verify_error)
+        if not verified then tx.release();return done(nil, verify_error) end
+        local function attach(live)
+          if not live or not live.identity then tx.release();return done(nil, runtime_failure('identity_unverifiable', 'Herdr did not return a verified session identity')) end
+          local unique_live, live_error = unique_agent(tx, live.identity)
+          if not unique_live then tx.release();return done(nil, live_error) end
+          local stored = stored_identity(live.identity)
+          if not vim.deep_equal(tx.task.agent, stored) or tx.task.pending_start then
+            tx.task.agent = stored
+            tx.task.pending_start = nil
+            local saved, save_error = tx.commit()
+            if not saved then tx.release();return done(nil, runtime_failure('save_failed', tostring(save_error), { agent = live.identity })) end
+          end
+          local root = tx.root
+          tx.release()
+          local opened, open_error = require('agent-board.terminal').open(terminal_key(root, ref.id), live.identity, opts)
+          if not opened then return done(nil, open_error) end
+          done(live)
+        end
+        if verified.state == 'running' then return attach(verified.agent) end
+        if verified.state ~= 'offline' then
+          tx.release()
+          return done(nil, runtime_failure('unavailable', verified.reason or 'provider session is not resumable'))
+        end
+        local herdr = require('agent-board.herdr')
+        herdr.list(guarded(tx, done, function(agents, list_error)
+          if not agents then tx.release();return done(nil, list_error) end
+          local name = 'ab-' .. vim.fn.sha256(tx.root .. '\0' .. tx.task.id):sub(1, 16)
+          for _, live in ipairs(agents) do
+            if live.identity.provider == provider and live.identity.session_id == session_id then
+              if live.cwd ~= conversation.cwd then
+                tx.release()
+                return done(nil, runtime_failure('identity_mismatch', 'The provider session is running in a different directory'))
+              end
+              return attach(live)
+            end
+            if live.identity.name == name then
+              tx.release()
+              return done(nil, runtime_failure('runtime_unknown', 'A task runtime already exists but its session identity does not match'))
+            end
+          end
+          if tx.task.pending_start then
+            tx.release()
+            return done(nil, runtime_failure('runtime_unknown', 'Previous provider session start is unverified; recover its Herdr runtime before retrying'))
+          end
+          tx.task.pending_start = true
+          local reserved, reserve_error = tx.commit()
+          if not reserved then tx.release();return done(nil, runtime_failure('save_failed', tostring(reserve_error))) end
+          local function on_started(started, start_error)
+            if not started then
+              if not (start_error and start_error.host) then
+                tx.task.pending_start = nil
+                tx.commit()
+              end
+              tx.release()
+              return done(nil, start_error or runtime_failure('runtime_unavailable', 'Herdr could not resume the provider session'))
+            end
+            if not started.identity or started.identity.provider ~= provider or started.identity.session_id ~= session_id then
+              tx.release()
+              return done(nil, runtime_failure('identity_mismatch', 'Provider started a different session', { host = started.host }))
+            end
+            return attach({ identity = started.identity, cwd = conversation.cwd })
+          end
+          local ok, start_error = pcall(herdr.start, conversation.cwd, provider, name,
+            guarded(tx, done, on_started), { agent_args = agent_args, expected_session_id = session_id })
+          if not ok then tx.release();done(nil,runtime_failure('runtime_unknown',tostring(start_error))) end
+        end))
+      end))
+    end)
+  end
+  discover()
+end
+
 function M.open_agent(ref, expected_agent, callback, opts)
   if type(expected_agent) == 'function' then opts, callback, expected_agent = callback, expected_agent, nil end
   if type(callback) ~= 'function' then return nil, 'a callback is required' end
@@ -781,13 +912,67 @@ function M.open_agent(ref, expected_agent, callback, opts)
   if current and expected_agent and not vim.deep_equal(current.agent, expected_agent) then
     return callback(nil, runtime_failure('conflict', 'task agent link changed; reload before acting'))
   end
-  if current and linked(current.conversation) then return M.open_conversation(ref, callback, opts) end
+  if current and linked(current.conversation) then
+    if current.conversation.provider == 'claude' then return M.open_conversation(ref, callback, opts) end
+    if linked(current.agent) then
+      local done = callback_once(callback)
+      local herdr = require('agent-board.herdr')
+      local function on_resolved(live, resolve_error)
+        if live then
+          if live.identity.provider ~= current.conversation.provider
+            or live.identity.session_id ~= current.conversation.session_id
+            or live.cwd ~= current.conversation.cwd then
+            return done(nil, runtime_failure('identity_mismatch', 'The running provider session does not match the task link'))
+          end
+          local root, root_error = M.resolve_repo(ref.repo)
+          if not root then return done(nil, runtime_failure('repo_unavailable', root_error)) end
+          local opened, open_error = require('agent-board.terminal').open(
+            terminal_key(root, current.id), live.identity, opts)
+          return done(opened and live or nil, open_error)
+        end
+        if resolve_error and resolve_error.code == 'offline' then
+          return open_provider_session(ref, done, opts)
+        end
+        done(nil, resolve_error or runtime_failure('runtime_unavailable', 'could not verify the linked provider session'))
+      end
+      local ok, resolve_error = pcall(herdr.resolve, runtime_identity(current.agent), on_resolved)
+      if not ok then done(nil, runtime_failure('runtime_error', tostring(resolve_error))) end
+      return
+    end
+    return open_provider_session(ref, callback, opts)
+  end
   if current and linked(current.agent) and current.agent.provider=='claude'
     and require('agent-board.claude').valid_id(current.agent.session_id) then
     return promote_legacy_conversation(ref,current,function(promoted,err)
       if not promoted then return callback(nil,err) end
       M.open_conversation(ref,callback,opts)
     end)
+  end
+  if current and linked(current.agent) and current.agent.provider ~= 'claude' then
+    local identity = current.agent
+    if type(identity.session_id) ~= 'string' or identity.session_id == '' then
+      return callback(nil, runtime_failure('identity_unverifiable', 'Herdr did not save a native provider session ID'))
+    end
+    local root, root_error = M.resolve_repo(ref.repo)
+    if not root then return callback(nil, runtime_failure('repo_unavailable', root_error)) end
+    local conversation
+    for _, record in ipairs(require('agent-board.provider_sessions').list(root)) do
+      if record.conversation.provider == identity.provider and record.conversation.session_id == identity.session_id then
+        conversation = record.conversation
+        break
+      end
+    end
+    conversation = conversation or { provider = identity.provider, session_id = identity.session_id, cwd = root }
+    local tx, tx_error = begin_transaction(ref)
+    if not tx then return callback(nil, tx_error) end
+    if not same_agent(tx.task.agent, identity) then tx.release();return callback(nil, runtime_failure('conflict', 'task agent changed')) end
+    local unique, unique_error = unique_conversation(tx, conversation)
+    if not unique then tx.release();return callback(nil, unique_error) end
+    tx.task.conversation = vim.deepcopy(conversation)
+    local saved, save_error = tx.commit()
+    tx.release()
+    if not saved then return callback(nil, runtime_failure('save_failed', tostring(save_error))) end
+    return open_provider_session(ref, callback, opts)
   end
   local done = callback_once(callback)
   local task, identity_or_error = get_linked_identity(ref, expected_agent)
@@ -884,9 +1069,9 @@ unique_conversation = function(tx, conversation)
     if not document then return nil, runtime_failure('board_unavailable', tostring(read_error)) end
     for _, other in ipairs(document.tasks) do
       if (root ~= tx.root or other.id ~= tx.task.id) and
-        ((linked(other.conversation) and other.conversation.session_id == conversation.session_id)
-        or (linked(other.agent) and other.agent.provider == 'claude' and other.agent.session_id == conversation.session_id)) then
-        return nil, runtime_failure('already_bound', 'this Claude conversation is already linked to a task')
+        (same_conversation(other.conversation, conversation)
+        or (linked(other.agent) and other.agent.provider == conversation.provider and other.agent.session_id == conversation.session_id)) then
+        return nil, runtime_failure('already_bound', 'this provider session is already linked to a task')
       end
     end
   end
@@ -901,18 +1086,23 @@ function M.bind_conversation(ref, conversation, expected_snapshot, callback)
   if not current then return done(nil, runtime_failure('task_not_found', task_error)) end
   if linked(current.agent) or linked(current.conversation) then return done(nil, runtime_failure('already_linked', 'task already has a linked session')) end
   local claude = require('agent-board.claude')
-  if type(conversation) ~= 'table' or conversation.provider ~= 'claude' or not claude.valid_id(conversation.session_id) then
-    return done(nil, runtime_failure('unavailable', 'Invalid Claude conversation'))
+  local provider_valid = type(conversation) == 'table'
+    and (conversation.provider == 'claude' or conversation.provider == 'codex' or conversation.provider == 'pi')
+  local session_valid = provider_valid and type(conversation.session_id) == 'string'
+    and (conversation.provider == 'claude' and claude.valid_id(conversation.session_id)
+      or conversation.provider ~= 'claude' and conversation.session_id:match('^[%w][%w._%-]*$') ~= nil)
+  if not session_valid then
+    return done(nil, runtime_failure('unavailable', 'Invalid provider session'))
   end
   require('agent-board.sessions').list(ref.repo,function(discovery,discovery_error)
     if not discovery then return done(nil,discovery_error) end
     local selected
     for _,row in ipairs(discovery.sessions) do
-      if row.conversation and row.conversation.session_id==conversation.session_id then selected=row;break end
+      if same_conversation(row.conversation, conversation) then selected=row;break end
     end
-    if not selected then return done(nil,runtime_failure('unavailable','Claude conversation has no local metadata or verified live runtime')) end
-    if selected.conversation.cwd~=conversation.cwd then return done(nil,runtime_failure('identity_mismatch','Conversation cwd does not match local metadata or runtime')) end
-    if selected.state=='unavailable' or (selected.state=='unknown' and not (discovery.runtime_error and not selected.agent and not selected.ambiguous)) then return done(nil,runtime_failure('runtime_unknown',selected.reason or 'Claude session state is unknown')) end
+    if not selected then return done(nil,runtime_failure('unavailable',conversation.provider .. ' session has no local metadata or verified live runtime')) end
+    if selected.conversation.cwd~=conversation.cwd then return done(nil,runtime_failure('identity_mismatch','Session cwd does not match local metadata or runtime')) end
+    if selected.state=='unavailable' or (selected.state=='unknown' and not (discovery.runtime_error and not selected.agent and not selected.ambiguous)) then return done(nil,runtime_failure('runtime_unknown',selected.reason or 'Provider session state is unknown')) end
     local tx, tx_error = begin_transaction(ref, expected_snapshot)
     if not tx then return done(nil, tx_error) end
     if linked(tx.task.agent) or linked(tx.task.conversation) then tx.release();return done(nil, runtime_failure('already_linked', 'task already has a linked session')) end
@@ -942,7 +1132,7 @@ function M.list_sessions(ref, callback)
     end
     for _, session in ipairs(discovery.sessions) do
       for _, row in ipairs(rows or {}) do
-        if (session.conversation and linked(row.task.conversation) and session.conversation.session_id == row.task.conversation.session_id)
+        if same_conversation(session.conversation, row.task.conversation)
           or (session.agent and same_agent(row.task.agent, session.agent.identity)) then session.bound = true;session.bound_title = row.task.title end
       end
     end
@@ -971,6 +1161,12 @@ local function launch_conversation(tx, conversation, mode, done, terminal_opts, 
       end
       tx.release()
       return done(nil, start_error or runtime_failure('runtime_unknown', 'Herdr start outcome is unknown'))
+    end
+    if not started.identity or started.identity.provider ~= 'claude'
+      or started.identity.session_id ~= conversation.session_id then
+      uncertain[key] = {conversation=conversation,host=started.host,agent=started.identity}
+      tx.release()
+      return done(nil, runtime_failure('identity_mismatch', 'Claude resumed a different native conversation', {agent=started.identity,host=started.host}))
     end
     local unique, unique_error = unique_agent(tx, started.identity)
     if not unique then tx.release();unique_error.agent=started.identity;unique_error.host=started.host;return done(nil, unique_error) end
@@ -1031,22 +1227,50 @@ function M.open_conversation(ref, callback, opts, return_task)
       -- Re-query while holding the shared coordinator lock before creating a runtime.
       sessions.resolve(conversation,guarded(tx,done,function(verified,verify_error)
         if not verified then tx.release();return done(nil,verify_error) end
-        if verified.state=='running' then
-          if tx.task.pending_start or not same_agent(tx.task.agent,verified.agent.identity) then
-            tx.task.pending_start = nil
-            tx.task.agent=stored_identity(verified.agent.identity)
+        local function attach(live)
+          if not live or not live.identity then tx.release();return done(nil,runtime_failure('identity_unverifiable','Herdr did not return a verified Claude identity')) end
+          local unique,unique_error=unique_agent(tx,live.identity)
+          if not unique then tx.release();return done(nil,unique_error) end
+          local stored=stored_identity(live.identity)
+          if tx.task.pending_start or not same_agent(tx.task.agent,stored) then
+            tx.task.pending_start=nil
+            tx.task.agent=stored
             local saved,save_error=tx.commit()
-            if not saved then tx.release();return done(nil,runtime_failure('save_failed',tostring(save_error),{agent=verified.agent.identity})) end
+            if not saved then tx.release();return done(nil,runtime_failure('save_failed',tostring(save_error),{agent=live.identity})) end
           end
+          local root=tx.root
           tx.release()
-          local opened,open_error=require('agent-board.terminal').open(terminal_key(tx.root,tx.task.id),verified.agent.identity,opts)
+          local opened,open_error=require('agent-board.terminal').open(terminal_key(root,tx.task.id),live.identity,opts)
           if return_task and opened then return done(vim.deepcopy(tx.task)) end
-          return done(opened and verified.agent or nil,open_error)
+          done(opened and live or nil,open_error)
         end
-        if tx.task.pending_start then tx.release();return done(nil,runtime_failure('runtime_unknown','Previous Claude start is unverified; recover its Herdr runtime before retrying')) end
+        if verified.state=='running' then
+          return attach(verified.agent)
+        end
+        if verified.state~='offline' then tx.release();return done(nil,runtime_failure('runtime_unknown',verified.reason or 'Claude session state is unknown')) end
         local recovery=uncertain[terminal_key(tx.root,tx.task.id)]
         if recovery then tx.release();return done(nil,runtime_failure('runtime_unknown','Previous start outcome is unknown; inspect its Herdr host',recovery)) end
-        launch_conversation(tx,conversation,'--resume',done,opts,return_task)
+        local herdr=require('agent-board.herdr')
+        herdr.list(guarded(tx,done,function(agents,list_error)
+          if not agents then tx.release();return done(nil,list_error) end
+          local name='ab-'..vim.fn.sha256(tx.root..'\0'..tx.task.id):sub(1,16)
+          for _,live in ipairs(agents) do
+            local identity=live.identity or {}
+            if identity.provider=='claude' and identity.session_id==conversation.session_id then
+              if live.cwd~=conversation.cwd then tx.release();return done(nil,runtime_failure('identity_mismatch','Claude session is running in a different directory')) end
+              return attach(live)
+            end
+            if identity.name==name then
+              tx.release()
+              return done(nil,runtime_failure('runtime_unknown','A task runtime already exists but its Claude session identity does not match'))
+            end
+          end
+          if tx.task.pending_start then
+            tx.release()
+            return done(nil,runtime_failure('runtime_unknown','Previous Claude session start is unverified; recover its Herdr runtime before retrying'))
+          end
+          launch_conversation(tx,conversation,'--resume',done,opts,return_task)
+        end))
       end))
     end)
   end

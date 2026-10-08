@@ -151,7 +151,7 @@ local function preview_string(data,pos)
         if codepoint>=0xD800 and codepoint<=0xDFFF then codepoint=0xFFFD end
         value=utf8_char(codepoint)
       else
-        value=({['"']='"',['\\']='\\',['/']='/',b=' ',f=' ',n=' ',r=' ',t=' '})[escape] or ' '
+        value=({['"']='"',['\\']='\\',['/']='/',b=' ',f=' ',n='\n',r='\r',t='\t'})[escape] or ' '
         step=2
       end
     else
@@ -282,7 +282,7 @@ end
 
 local function merge_preview(record, role, text, timestamp)
   if (role~='user' and role~='assistant') or type(text)~='string' then return end
-  text=text:gsub('[%z\1-\31\127]+',' '):gsub('%s+',' '):gsub('^%s+',''):gsub('%s+$','')
+  text=text:gsub('[%z\1-\9\11-\31\127]+',' '):gsub('[ \t]+',' '):gsub(' *\n *','\n'):gsub('\n+','\n'):gsub('^%s+',''):gsub('%s+$','')
   if text=='' then return end
   record.preview=record.preview or {}
   local current=record.preview[role]

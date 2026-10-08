@@ -9,6 +9,7 @@ function M.start_agent(ref, opts, callback)
   if type(callback) ~= 'function' then return nil, 'a callback is required' end
   return tasks.start_agent(ref, opts, function(task, err)
     if not task or not task.existing then return callback(task, err) end
+    if task.terminal_opened then return callback(task, err) end
     M.open_agent(ref, function(_, open_error)
       callback(open_error and nil or task, open_error)
     end, opts.terminal_opts)
